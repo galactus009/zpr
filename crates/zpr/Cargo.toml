@@ -1,0 +1,30 @@
+[package]
+name = "zpr"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "zpr (Zero Portable Runtime): a C-ABI shim exposing JSON parsing, an HTTP client, and a generic gRPC/protobuf client+server to Object Pascal (Lazarus/Delphi), which has none of them natively."
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "zpr"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "net", "io-util"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+tonic = { version = "0.12", default-features = false, features = ["transport", "codegen", "tls-webpki-roots"] }
+tower = { version = "0.4", default-features = false }
+prost = "0.13"
+prost-reflect = { version = "0.14", features = ["serde"] }
+bytes = "1"
+http = "1"
+http-body-util = "0.1"
+futures-util = { version = "0.3", default-features = false }
+hyper = { version = "1", features = ["http2", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "http2"] }
+
+[build-dependencies]
+cbindgen = "0.27"
