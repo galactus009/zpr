@@ -1,6 +1,6 @@
 [package]
 name = "zpr"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.75"
 description = "zpr (Zero Portable Runtime): a C-ABI shim exposing JSON parsing, an HTTP client, and a generic gRPC/protobuf client+server to Object Pascal (Lazarus/Delphi), which has none of them natively."

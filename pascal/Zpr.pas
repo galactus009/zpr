@@ -79,6 +79,7 @@ type
   PDescriptorPool = Pointer;
   PGrpcServerHandle = Pointer;
   PGrpcStream = Pointer;
+  PGrpcClientStream = Pointer;
 
   // Mirrors the C ZprBuffer struct exactly: a Rust-owned byte buffer.
   // Application code normally never sees this directly — the wrapper
@@ -217,16 +218,42 @@ type
 // ---------------------------------------------------------------------
 
 type
+  // Non-owning wrapper around a server-streaming call opened by
+  // TZprGrpcClient.OpenStream. A unary call is just the degenerate case of
+  // this with exactly one read.
+  TZprGrpcClientStream = class
+  private
+    FHandle: PGrpcClientStream;
+  public
+    constructor Create(AHandle: PGrpcClientStream);
+    destructor Destroy; override;
+
+    // Blocks until the next message arrives. Returns False once the server
+    // has finished cleanly (not an error — the stream just ended).
+    function Read(out AData: TBytes): Boolean;
+  end;
+
   TZprGrpcClient = class
   public
     // Makes one unary call. AEndpoint is a URI, e.g. "http://127.0.0.1:50051"
     // (or "https://..." for TLS). AMethodPath is the full gRPC path, e.g.
-    // "/pkg.Service/Method". Raises EError only for a transport-level
-    // failure (never reaching a gRPC status); a non-OK gRPC status is
-    // reported via AGrpcStatus instead (0 = OK), since that's an ordinary
-    // RPC-level outcome the caller should handle, not an exception.
+    // "/pkg.Service/Method". AMetadataJson is an optional (pass '' for none)
+    // JSON object of gRPC metadata/headers to send with the call — build it
+    // once wherever your auth headers already live and pass it on every
+    // call. Raises EError only for a transport-level failure (never
+    // reaching a gRPC status); a non-OK gRPC status is reported via
+    // AGrpcStatus instead (0 = OK), since that's an ordinary RPC-level
+    // outcome the caller should handle, not an exception.
     class function Call(const AEndpoint, AMethodPath: UTF8String; const ARequest: TBytes;
-      ATimeoutMs: Cardinal; out AGrpcStatus: Integer): TBytes;
+      ATimeoutMs: Cardinal; out AGrpcStatus: Integer; const AMetadataJson: UTF8String = ''): TBytes;
+
+    // Opens a server-streaming call, sending ARequest as the single
+    // initiating message. ATimeoutMs bounds only opening the call, never
+    // the stream's lifetime. Raises EError for a transport-level failure or
+    // a non-OK gRPC status (unlike Call, there is no partial-success
+    // shape to hand back before any message has arrived).
+    class function OpenStream(const AEndpoint, AMethodPath: UTF8String; const ARequest: TBytes;
+      ATimeoutMs: Cardinal; const AMetadataJson: UTF8String = ''): TZprGrpcClientStream;
 
     class procedure SetProxy(const AProxyUrl: UTF8String);
     class procedure DisableProxy;
@@ -380,9 +407,15 @@ type
   Tzpr_last_error = function: PAnsiChar; cdecl;
 
   Tzpr_grpc_set_proxy = function(ProxyUrl: PAnsiChar): Int32; cdecl;
-  Tzpr_grpc_call = function(Endpoint, MethodPath: PAnsiChar; Request: PByte;
+  Tzpr_grpc_call = function(Endpoint, MethodPath, MetadataJson: PAnsiChar; Request: PByte;
     RequestLen: NativeUInt; TimeoutMs: UInt32; out OutResponse: TZprBuffer;
     out OutGrpcStatus: Int32): Int32; cdecl;
+
+  Tzpr_grpc_client_stream_open = function(Endpoint, MethodPath, MetadataJson: PAnsiChar; Request: PByte;
+    RequestLen: NativeUInt; TimeoutMs: UInt32; out OutHandle: PGrpcClientStream;
+    out OutGrpcStatus: Int32): Int32; cdecl;
+  Tzpr_grpc_client_stream_read = function(Stream: PGrpcClientStream; out Output: TZprBuffer): Int32; cdecl;
+  Tzpr_grpc_client_stream_cancel = procedure(Stream: PGrpcClientStream); cdecl;
 
   Tzpr_protobuf_pool_new = function(DescriptorSet: PByte; Len: NativeUInt): PDescriptorPool; cdecl;
   Tzpr_protobuf_pool_free = procedure(Handle: PDescriptorPool); cdecl;
@@ -434,6 +467,9 @@ var
 
   zpr_grpc_set_proxy: Tzpr_grpc_set_proxy;
   zpr_grpc_call: Tzpr_grpc_call;
+  zpr_grpc_client_stream_open: Tzpr_grpc_client_stream_open;
+  zpr_grpc_client_stream_read: Tzpr_grpc_client_stream_read;
+  zpr_grpc_client_stream_cancel: Tzpr_grpc_client_stream_cancel;
 
   zpr_protobuf_pool_new: Tzpr_protobuf_pool_new;
   zpr_protobuf_pool_free: Tzpr_protobuf_pool_free;
@@ -518,6 +554,9 @@ begin
 
     zpr_grpc_set_proxy := Tzpr_grpc_set_proxy(Resolve('zpr_grpc_set_proxy'));
     zpr_grpc_call := Tzpr_grpc_call(Resolve('zpr_grpc_call'));
+    zpr_grpc_client_stream_open := Tzpr_grpc_client_stream_open(Resolve('zpr_grpc_client_stream_open'));
+    zpr_grpc_client_stream_read := Tzpr_grpc_client_stream_read(Resolve('zpr_grpc_client_stream_read'));
+    zpr_grpc_client_stream_cancel := Tzpr_grpc_client_stream_cancel(Resolve('zpr_grpc_client_stream_cancel'));
 
     zpr_protobuf_pool_new := Tzpr_protobuf_pool_new(Resolve('zpr_protobuf_pool_new'));
     zpr_protobuf_pool_free := Tzpr_protobuf_pool_free(Resolve('zpr_protobuf_pool_free'));
@@ -870,16 +909,71 @@ end;
 // =======================================================================
 
 class function TZprGrpcClient.Call(const AEndpoint, AMethodPath: UTF8String;
-  const ARequest: TBytes; ATimeoutMs: Cardinal; out AGrpcStatus: Integer): TBytes;
+  const ARequest: TBytes; ATimeoutMs: Cardinal; out AGrpcStatus: Integer;
+  const AMetadataJson: UTF8String): TBytes;
 var
+  MetaPtr: PAnsiChar;
   Resp: TZprBuffer;
   Rc: Int32;
 begin
-  Rc := zpr_grpc_call(Utf8Ptr(AEndpoint), Utf8Ptr(AMethodPath), BytesPtr(ARequest),
+  if AMetadataJson = '' then
+    MetaPtr := nil
+  else
+    MetaPtr := Utf8Ptr(AMetadataJson);
+  Rc := zpr_grpc_call(Utf8Ptr(AEndpoint), Utf8Ptr(AMethodPath), MetaPtr, BytesPtr(ARequest),
     Length(ARequest), ATimeoutMs, Resp, AGrpcStatus);
   if Rc = GRPC_CALL_TRANSPORT_ERR then
     raise EError.Create(string(LastError));
   Result := BufferToBytes(Resp);
+end;
+
+class function TZprGrpcClient.OpenStream(const AEndpoint, AMethodPath: UTF8String;
+  const ARequest: TBytes; ATimeoutMs: Cardinal; const AMetadataJson: UTF8String): TZprGrpcClientStream;
+var
+  MetaPtr: PAnsiChar;
+  H: PGrpcClientStream;
+  GrpcStatus: Int32;
+begin
+  if AMetadataJson = '' then
+    MetaPtr := nil
+  else
+    MetaPtr := Utf8Ptr(AMetadataJson);
+  Check(zpr_grpc_client_stream_open(Utf8Ptr(AEndpoint), Utf8Ptr(AMethodPath), MetaPtr,
+    BytesPtr(ARequest), Length(ARequest), ATimeoutMs, H, GrpcStatus));
+  Result := TZprGrpcClientStream.Create(H);
+end;
+
+constructor TZprGrpcClientStream.Create(AHandle: PGrpcClientStream);
+begin
+  inherited Create;
+  FHandle := AHandle;
+end;
+
+destructor TZprGrpcClientStream.Destroy;
+begin
+  if FHandle <> nil then
+    zpr_grpc_client_stream_cancel(FHandle);
+  inherited Destroy;
+end;
+
+function TZprGrpcClientStream.Read(out AData: TBytes): Boolean;
+var
+  Buf: TZprBuffer;
+  Rc: Int32;
+begin
+  Rc := zpr_grpc_client_stream_read(FHandle, Buf);
+  case Rc of
+    1: begin
+         AData := BufferToBytes(Buf);
+         Result := True;
+       end;
+    0: begin
+         AData := nil;
+         Result := False;
+       end;
+  else
+    raise EError.Create(string(LastError));
+  end;
 end;
 
 class procedure TZprGrpcClient.SetProxy(const AProxyUrl: UTF8String);

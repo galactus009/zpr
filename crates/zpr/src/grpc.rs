@@ -31,6 +31,7 @@ use prost_reflect::{DescriptorPool, DynamicMessage};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
+use tonic::metadata::{Ascii, MetadataKey, MetadataValue};
 use tonic::transport::{Channel, Endpoint};
 
 use crate::ffi::{self, cstr_to_str, runtime, string_to_cstring_ptr, ZprBuffer, ZPR_ERR, ZPR_OK};
@@ -276,6 +277,24 @@ async fn drop_channel(endpoint: &str) {
     CHANNELS.get_or_init(Default::default).lock().unwrap().remove(endpoint);
 }
 
+/// Inserts `metadata_json` (a JSON object of `{"header-name": "value"}`, or
+/// NULL for none) into `req`'s gRPC metadata. Both apps this transport was
+/// built for stamp the same auth/edge headers on *every* call — unary and
+/// streaming alike — from one call site, so this is the single place that
+/// contract is honored rather than something each caller has to get right.
+fn apply_metadata_json(req: &mut tonic::Request<Vec<u8>>, metadata_json: Option<&str>) -> Result<(), String> {
+    let Some(json) = metadata_json else { return Ok(()) };
+    let value: serde_json::Value = serde_json::from_str(json).map_err(|e| format!("invalid metadata JSON: {e}"))?;
+    let obj = value.as_object().ok_or("metadata JSON must be an object")?;
+    for (k, v) in obj {
+        let s = v.as_str().ok_or_else(|| format!("metadata {k:?} value must be a string"))?;
+        let key = MetadataKey::<Ascii>::from_bytes(k.as_bytes()).map_err(|e| format!("invalid metadata key {k:?}: {e}"))?;
+        let val = MetadataValue::try_from(s).map_err(|e| format!("invalid metadata value for {k:?}: {e}"))?;
+        req.metadata_mut().insert(key, val);
+    }
+    Ok(())
+}
+
 /// Result codes for `zpr_grpc_call`.
 pub const GRPC_CALL_OK: i32 = 0;
 /// A response was received but carried a non-OK `grpc-status`; see
@@ -288,7 +307,11 @@ pub const GRPC_CALL_TRANSPORT_ERR: i32 = -1;
 /// Makes one generic unary gRPC call.
 ///
 /// `endpoint` is a URI such as `"http://127.0.0.1:50051"`. `method_path` is
-/// the full gRPC path, e.g. `"/sapphire.v1.Sapphire/Login"`. `request`/
+/// the full gRPC path, e.g. `"/sapphire.v1.Sapphire/Login"`. `metadata_json`
+/// is an optional (may be NULL) JSON object of gRPC metadata/headers to send
+/// with the call, e.g. `{"x-api-key": "..."}` — build it once at the call
+/// site that already owns your auth headers and pass it on every call,
+/// mirroring how a single interceptor would apply it. `request`/
 /// `request_len` is the already-protobuf-encoded request message (build it
 /// with `zpr_protobuf_json_to_binary`). On `GRPC_CALL_OK`, `*out_response`
 /// holds the raw response bytes (free with `zpr_buffer_free`; decode with
@@ -297,6 +320,7 @@ pub const GRPC_CALL_TRANSPORT_ERR: i32 = -1;
 pub extern "C" fn zpr_grpc_call(
     endpoint: *const c_char,
     method_path: *const c_char,
+    metadata_json: *const c_char,
     request: *const u8,
     request_len: usize,
     timeout_ms: u32,
@@ -332,6 +356,17 @@ pub extern "C" fn zpr_grpc_call(
                 return GRPC_CALL_TRANSPORT_ERR;
             }
         };
+        let metadata_json = if metadata_json.is_null() {
+            None
+        } else {
+            match unsafe { cstr_to_str(metadata_json) } {
+                Ok(s) => Some(s.to_string()),
+                Err(e) => {
+                    ffi::set_last_error(e);
+                    return GRPC_CALL_TRANSPORT_ERR;
+                }
+            }
+        };
         let body: Vec<u8> = if request.is_null() || request_len == 0 {
             Vec::new()
         } else {
@@ -347,6 +382,7 @@ pub extern "C" fn zpr_grpc_call(
                 .map_err(|e| format!("gRPC transport not ready for {endpoint:?}: {e}"))?;
 
             let mut req = tonic::Request::new(body);
+            apply_metadata_json(&mut req, metadata_json.as_deref())?;
             if timeout_ms > 0 {
                 req.set_timeout(Duration::from_millis(timeout_ms as u64));
             }
@@ -391,6 +427,176 @@ pub extern "C" fn zpr_grpc_call(
             }
         }
     })
+}
+
+// ---------------------------------------------------------------------
+// Client-side streaming: open a server-streaming call, then pull frames off
+// it one at a time. Every RPC on the wire contract that streams is
+// server-streaming only (no client-streaming or bidi), so that's the only
+// shape this covers — a distinct type from grpc_server.rs's `GrpcStream`
+// (that one is the server *handler's* view of an in-flight call; this one
+// is the client's view of a call it opened).
+// ---------------------------------------------------------------------
+
+/// Opaque handle to an open server-streaming call. Always end with
+/// `zpr_grpc_client_stream_cancel`.
+pub struct GrpcClientStream(tonic::Streaming<Vec<u8>>);
+
+/// Opens a server-streaming gRPC call, sending `request` as the single
+/// initiating message. `metadata_json` follows the same convention as
+/// `zpr_grpc_call`. Returns `GRPC_CALL_OK` and fills `*out_handle` if the
+/// server accepted the call and is streaming; `GRPC_CALL_STATUS_ERR` if it
+/// answered with a non-OK status before sending anything (see
+/// `*out_grpc_status`); `GRPC_CALL_TRANSPORT_ERR` for anything that never
+/// reached a status.
+///
+/// `timeout_ms` bounds only the time to open the call, never the stream's
+/// lifetime — a long-lived feed must not be killed by the same deadline
+/// that bounds a unary call opening it.
+#[no_mangle]
+pub extern "C" fn zpr_grpc_client_stream_open(
+    endpoint: *const c_char,
+    method_path: *const c_char,
+    metadata_json: *const c_char,
+    request: *const u8,
+    request_len: usize,
+    timeout_ms: u32,
+    out_handle: *mut *mut GrpcClientStream,
+    out_grpc_status: *mut i32,
+) -> i32 {
+    if !out_handle.is_null() {
+        unsafe { *out_handle = std::ptr::null_mut() };
+    }
+    if !out_grpc_status.is_null() {
+        unsafe { *out_grpc_status = -1 };
+    }
+
+    ffi::guard(GRPC_CALL_TRANSPORT_ERR, move || {
+        let endpoint = match unsafe { cstr_to_str(endpoint) } {
+            Ok(s) => s.to_string(),
+            Err(e) => {
+                ffi::set_last_error(e);
+                return GRPC_CALL_TRANSPORT_ERR;
+            }
+        };
+        let method_path = match unsafe { cstr_to_str(method_path) } {
+            Ok(s) => s.to_string(),
+            Err(e) => {
+                ffi::set_last_error(e);
+                return GRPC_CALL_TRANSPORT_ERR;
+            }
+        };
+        let path: http::uri::PathAndQuery = match method_path.parse() {
+            Ok(p) => p,
+            Err(e) => {
+                ffi::set_last_error(format!("invalid gRPC method path {method_path:?}: {e}"));
+                return GRPC_CALL_TRANSPORT_ERR;
+            }
+        };
+        let metadata_json = if metadata_json.is_null() {
+            None
+        } else {
+            match unsafe { cstr_to_str(metadata_json) } {
+                Ok(s) => Some(s.to_string()),
+                Err(e) => {
+                    ffi::set_last_error(e);
+                    return GRPC_CALL_TRANSPORT_ERR;
+                }
+            }
+        };
+        let body: Vec<u8> = if request.is_null() || request_len == 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(request, request_len) }.to_vec()
+        };
+
+        let outcome: Result<Result<tonic::Streaming<Vec<u8>>, tonic::Status>, String> =
+            runtime().block_on(async move {
+                let channel = get_channel(&endpoint).await?;
+                let mut client = tonic::client::Grpc::new(channel);
+                client
+                    .ready()
+                    .await
+                    .map_err(|e| format!("gRPC transport not ready for {endpoint:?}: {e}"))?;
+
+                let mut req = tonic::Request::new(body);
+                apply_metadata_json(&mut req, metadata_json.as_deref())?;
+                if timeout_ms > 0 {
+                    req.set_timeout(Duration::from_millis(timeout_ms as u64));
+                }
+
+                match client.server_streaming(req, path, BytesCodec).await {
+                    Ok(resp) => Ok(Ok(resp.into_inner())),
+                    Err(status) => Ok(Err(status)),
+                }
+            });
+
+        match outcome {
+            Ok(Ok(stream)) => {
+                if !out_grpc_status.is_null() {
+                    unsafe { *out_grpc_status = 0 };
+                }
+                let handle = Box::into_raw(Box::new(GrpcClientStream(stream)));
+                if !out_handle.is_null() {
+                    unsafe { *out_handle = handle };
+                }
+                GRPC_CALL_OK
+            }
+            Ok(Err(status)) => {
+                if !out_grpc_status.is_null() {
+                    unsafe { *out_grpc_status = status.code() as i32 };
+                }
+                ffi::set_last_error(status.message().to_string());
+                GRPC_CALL_STATUS_ERR
+            }
+            Err(e) => {
+                ffi::set_last_error(e);
+                GRPC_CALL_TRANSPORT_ERR
+            }
+        }
+    })
+}
+
+/// Blocks until the next message arrives on a stream opened by
+/// `zpr_grpc_client_stream_open`. Returns 1 and fills `*out` (owned — free
+/// with `zpr_buffer_free`) if a message arrived, 0 if the server has
+/// finished cleanly, or `ZPR_ERR` on a stream-level error (check
+/// `zpr_last_error()`).
+#[no_mangle]
+pub extern "C" fn zpr_grpc_client_stream_read(stream: *mut GrpcClientStream, out: *mut ZprBuffer) -> i32 {
+    if !out.is_null() {
+        unsafe { *out = ZprBuffer::empty() };
+    }
+    if stream.is_null() {
+        ffi::set_last_error("null stream handle passed to zpr_grpc_client_stream_read");
+        return ZPR_ERR;
+    }
+    ffi::guard(ZPR_ERR, move || {
+        let s = unsafe { &mut *stream };
+        match runtime().block_on(s.0.message()) {
+            Ok(Some(msg)) => {
+                if !out.is_null() {
+                    unsafe { *out = ZprBuffer::from_vec(msg) };
+                }
+                1
+            }
+            Ok(None) => 0,
+            Err(status) => {
+                ffi::set_last_error(status.message().to_string());
+                ZPR_ERR
+            }
+        }
+    })
+}
+
+/// Ends and frees a stream opened by `zpr_grpc_client_stream_open`. Safe to
+/// call even after `zpr_grpc_client_stream_read` returned 0. Do not use the
+/// handle afterward.
+#[no_mangle]
+pub extern "C" fn zpr_grpc_client_stream_cancel(stream: *mut GrpcClientStream) {
+    if !stream.is_null() {
+        unsafe { drop(Box::from_raw(stream)) };
+    }
 }
 
 // ---------------------------------------------------------------------
