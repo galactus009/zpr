@@ -8,6 +8,7 @@ pub mod grpc;
 pub mod grpc_server;
 pub mod http;
 pub mod json;
+pub mod transcode;
 
 use std::ffi::CString;
 use std::os::raw::c_char;

@@ -1111,6 +1111,49 @@ pub extern "C" fn zpr_grpc_client_stream_stats(
 /// `zpr_protobuf_pool_free`.
 pub struct DescriptorPoolHandle(DescriptorPool);
 
+impl DescriptorPoolHandle {
+    /// The pool itself, for callers inside this crate that need to route by
+    /// descriptor rather than convert one message.
+    pub(crate) fn pool(&self) -> &DescriptorPool {
+        &self.0
+    }
+}
+
+/// One unary call, as bytes in and bytes out, for callers already inside the
+/// runtime. Returns `(reply, grpc_status, error_message)`.
+///
+/// ⚠ IT RETURNS A STATUS RATHER THAN A `Result` BECAUSE A REFUSAL IS AN ANSWER.
+/// A daemon saying INVALID_ARGUMENT has answered the question; collapsing that
+/// into the same failure as an unreachable host loses the only thing that tells
+/// a caller whether to fix the request or retry it.
+pub(crate) async fn call_unary_bytes(
+    endpoint: &str,
+    path: &str,
+    request: Vec<u8>,
+    timeout_ms: u32,
+) -> (Vec<u8>, i32, String) {
+    let path = match http::uri::PathAndQuery::from_maybe_shared(path.to_string()) {
+        Ok(p) => p,
+        Err(e) => return (Vec::new(), 3, format!("bad method path: {e}")),
+    };
+    let channel = match get_channel(endpoint).await {
+        Ok(c) => c,
+        Err(e) => return (Vec::new(), 14, e),
+    };
+    let mut client = tonic::client::Grpc::new(channel);
+    if let Err(e) = client.ready().await {
+        return (Vec::new(), 14, format!("gRPC transport not ready for {endpoint:?}: {e}"));
+    }
+    let mut req = tonic::Request::new(request);
+    if timeout_ms > 0 {
+        req.set_timeout(Duration::from_millis(timeout_ms as u64));
+    }
+    match client.unary(req, path, BytesCodec).await {
+        Ok(resp) => (resp.into_inner(), 0, String::new()),
+        Err(status) => (Vec::new(), status.code() as i32, status.message().to_string()),
+    }
+}
+
 /// Loads a `FileDescriptorSet` (the binary output of
 /// `protoc --descriptor_set_out=out.bin --include_imports your.proto`).
 /// Returns NULL on failure — check `zpr_last_error()`.
