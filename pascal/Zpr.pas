@@ -228,16 +228,165 @@ type
   // Non-owning wrapper around a server-streaming call opened by
   // TZprGrpcClient.OpenStream. A unary call is just the degenerate case of
   // this with exactly one read.
+  // What a non-blocking read found.
+  TZprReadResult = (
+    zrNone,        // nothing waiting. The ORDINARY answer when polling, not an error.
+    zrMessage,     // a message was delivered
+    zrClientDone,  // the far end finished sending
+    zrShortBuffer, // the buffer was too small; the message is HELD, retry bigger
+    zrError        // see LastError
+  );
+
   TZprGrpcClientStream = class
   private
     FHandle: PGrpcClientStream;
+    FBuffered: Boolean;
+    function GetDepth: NativeUInt;
+    function GetDropped: UInt64;
   public
     constructor Create(AHandle: PGrpcClientStream);
     destructor Destroy; override;
 
     // Blocks until the next message arrives. Returns False once the server
     // has finished cleanly (not an error — the stream just ended).
+    //
+    // ⚠ AFTER Buffer THIS NO LONGER BLOCKS, and False then means "nothing right
+    // now" as well as "finished" — which is why polling code should use
+    // ReadInto, whose result tells the two apart.
     function Read(out AData: TBytes): Boolean;
+
+    // Reads into memory YOU own — no allocation, nothing to free. The shape a
+    // polling loop should use.
+    function ReadInto(ABuffer: PByte; ACapacity: NativeUInt; out ALength: NativeUInt): TZprReadResult;
+
+    // Switches to a bounded ring so reads stop blocking: a timer on the main
+    // thread becomes a complete feed loop, with no worker thread and nothing
+    // entering your program from a thread it did not create.
+    //
+    // ⚠ LOSSY, AND THAT IS THE TRADE. A full ring discards its OLDEST message.
+    // Right for marks and depth, where a stale tick is worthless. WRONG for
+    // order events: a dropped fill is a position you never hear about, and the
+    // next message does not carry what it said. Leave those unbuffered and read
+    // them on a worker thread.
+    procedure Buffer(ACapacity: NativeUInt);
+
+    property IsBuffered: Boolean read FBuffered;
+    // How many messages are waiting.
+    property Depth: NativeUInt read GetDepth;
+    // How many were DISCARDED because you did not keep up. ⚠ WATCH THIS. The
+    // messages you do receive look perfectly healthy either way; this counter
+    // is the only sign that anything went missing.
+    property Dropped: UInt64 read GetDropped;
+  end;
+
+  // Both halves of a bidirectional call — and of a client-streaming one, which
+  // is the same thing with a single read at the end.
+  TZprGrpcBidiStream = class
+  private
+    FHandle: PGrpcBidiStream;
+    FSendClosed: Boolean;
+  public
+    destructor Destroy; override;
+
+    // Opens the call. Nothing is sent until Send.
+    class function Open(const AEndpoint, AMethodPath: UTF8String; ASendCapacity: NativeUInt = 8;
+      ATimeoutMs: Cardinal = 5000; const AMetadataJson: UTF8String = ''): TZprGrpcBidiStream;
+
+    // Queues one request message. False means the send window is full — retry,
+    // it is not a failure.
+    function Send(const AData: TBytes): Boolean;
+
+    // Says no more requests are coming, leaving the response half open.
+    //
+    // ⚠ A CLIENT-STREAMING SERVER DOES NOT ANSWER UNTIL YOU CALL THIS. It is
+    // waiting for the end of your request stream to compute its one reply, so a
+    // program that only ever sends waits forever for a response it never asked
+    // to be produced.
+    procedure CloseSend;
+
+    function ReadInto(ABuffer: PByte; ACapacity: NativeUInt; out ALength: NativeUInt): TZprReadResult;
+    procedure Buffer(ACapacity: NativeUInt);
+
+    property SendClosed: Boolean read FSendClosed;
+  end;
+
+  // One inbound RPC, handed over by TZprGrpcQueuedServer.Accept. You own it and
+  // must free it; freeing completes the call if you did not.
+  TZprGrpcCall = class
+  private
+    FQueue: PCallQueue;
+    FId: UInt64;
+    FMethodPath: UTF8String;
+    FCompleted: Boolean;
+  public
+    constructor Create(AQueue: PCallQueue; AId: UInt64; const AMethodPath: UTF8String);
+
+    // ⚠ COMPLETES THE CALL IF YOU FORGOT, with UNAVAILABLE. An RPC that is never
+    // completed holds its channels open and leaves the caller waiting on
+    // trailers that never arrive — the request HANGS rather than failing, which
+    // is the worst of the two. Relying on this is still a bug; it just is not
+    // a hung client as well.
+    destructor Destroy; override;
+
+    // Next request message. zrNone means "not yet" — poll again.
+    function Read(out AData: TBytes): TZprReadResult;
+
+    // One response message. A unary reply is exactly one of these.
+    function Write(const AData: TBytes): Boolean;
+
+    // Ends the call. 0 is OK; anything else is a google.rpc.Code.
+    procedure Complete(AStatus: Integer = 0; const AMessage: UTF8String = '');
+
+    property Id: UInt64 read FId;
+    property MethodPath: UTF8String read FMethodPath;
+    property IsCompleted: Boolean read FCompleted;
+  end;
+
+  // A gRPC server that QUEUES calls instead of calling you back.
+  //
+  // ⚠ THIS IS THE ONE A GUI SHOULD HOST. Nothing here ever enters your program
+  // from a thread it did not create: you Accept, answer, and Complete, all on
+  // whichever thread you like. TZprGrpcServer — the callback one — runs handlers
+  // on worker threads concurrently, which neither the LCL nor the VCL survives
+  // being touched from. Use that one only in a headless program.
+  TZprGrpcQueuedServer = class
+  private
+    FHandle: PGrpcServerHandle;
+    FQueue: PCallQueue;
+    function GetPending: NativeUInt;
+    function GetLive: NativeUInt;
+  public
+    destructor Destroy; override;
+
+    class function Start(const ABindAddr: UTF8String): TZprGrpcQueuedServer;
+
+    // The next waiting RPC, or nil when none is. Never blocks — call it from a
+    // timer. You own what it returns.
+    function Accept: TZprGrpcCall;
+
+    procedure Stop;
+
+    property Pending: NativeUInt read GetPending;
+    // Accepted and not yet completed. ⚠ A NUMBER THAT ONLY GROWS IS A LEAK —
+    // calls you accepted and never completed.
+    property Live: NativeUInt read GetLive;
+  end;
+
+  // REST/JSON in front of a gRPC-only daemon, routed entirely by a descriptor
+  // set — no route table, and nothing here knows a method name.
+  TZprTranscoder = class
+  private
+    FHandle: PTranscodeHandle;
+  public
+    destructor Destroy; override;
+
+    // Serves POST /package.Service/Method with a JSON body on ABindAddr,
+    // forwarding to AUpstream (an h2c gRPC endpoint). APool must outlive
+    // nothing — it is copied.
+    class function Start(const ABindAddr, AUpstream: UTF8String; APool: TZprProtobufPool;
+      ATimeoutMs: Cardinal = 5000): TZprTranscoder;
+
+    procedure Stop;
   end;
 
   TZprGrpcClient = class
@@ -760,6 +909,20 @@ function Utf8Ptr(const S: UTF8String): PAnsiChar;
 begin
   if Length(S) = 0 then
     Result := PAnsiChar(@EmptyStringByte)
+  else
+    Result := PAnsiChar(S);
+end;
+
+/// For arguments the library treats as OPTIONAL, where NULL means "not given".
+///
+/// ⚠ AN EMPTY STRING IS NOT THE SAME AS ABSENT HERE. `Utf8Ptr('')` hands over a
+/// pointer to an empty byte, which the Rust side reads as a present-but-empty
+/// value and then fails to parse — metadata JSON of "" is invalid JSON, not
+/// "no metadata". Optional arguments must be nil.
+function Utf8PtrOrNil(const S: UTF8String): PAnsiChar;
+begin
+  if Length(S) = 0 then
+    Result := nil
   else
     Result := PAnsiChar(S);
 end;
@@ -1384,6 +1547,288 @@ begin
   zpr_grpc_server_stop(FHandle);
   FHandle := nil;
 end;
+
+{ TZprGrpcClientStream — the buffered half }
+
+function TZprGrpcClientStream.ReadInto(ABuffer: PByte; ACapacity: NativeUInt;
+  out ALength: NativeUInt): TZprReadResult;
+var
+  Rc: Integer;
+begin
+  Rc := zpr_grpc_client_stream_read_into(FHandle, ABuffer, ACapacity, ALength);
+  case Rc of
+    1: Result := zrMessage;
+    0: Result := zrNone;
+    -2: Result := zrShortBuffer;
+  else
+    Result := zrError;
+  end;
+end;
+
+procedure TZprGrpcClientStream.Buffer(ACapacity: NativeUInt);
+begin
+  Check(zpr_grpc_client_stream_buffer(FHandle, ACapacity));
+  FBuffered := True;
+end;
+
+function TZprGrpcClientStream.GetDepth: NativeUInt;
+var
+  Dropped: UInt64;
+begin
+  Result := 0;
+  Dropped := 0;
+  zpr_grpc_client_stream_stats(FHandle, Result, Dropped);
+end;
+
+function TZprGrpcClientStream.GetDropped: UInt64;
+var
+  Depth: NativeUInt;
+begin
+  Result := 0;
+  Depth := 0;
+  zpr_grpc_client_stream_stats(FHandle, Depth, Result);
+end;
+
+{ TZprGrpcBidiStream }
+
+class function TZprGrpcBidiStream.Open(const AEndpoint, AMethodPath: UTF8String;
+  ASendCapacity: NativeUInt; ATimeoutMs: Cardinal; const AMetadataJson: UTF8String): TZprGrpcBidiStream;
+var
+  H: PGrpcBidiStream;
+  Status: Integer;
+begin
+  H := nil;
+  Status := 0;
+  if zpr_grpc_bidi_open(Utf8Ptr(AEndpoint), Utf8Ptr(AMethodPath), Utf8PtrOrNil(AMetadataJson),
+       ASendCapacity, ATimeoutMs, H, Status) <> 0 then
+    raise EError.CreateFmt('zpr: could not open %s (grpc-status %d): %s',
+      [string(AMethodPath), Status, string(LastError)]);
+  Result := TZprGrpcBidiStream.Create;
+  Result.FHandle := H;
+end;
+
+destructor TZprGrpcBidiStream.Destroy;
+begin
+  if FHandle <> nil then
+    zpr_grpc_bidi_cancel(FHandle);
+  FHandle := nil;
+  inherited Destroy;
+end;
+
+function TZprGrpcBidiStream.Send(const AData: TBytes): Boolean;
+var
+  Rc: Integer;
+begin
+  Rc := zpr_grpc_bidi_send(FHandle, BytesPtr(AData), Length(AData));
+  if Rc < 0 then
+    raise EError.CreateFmt('zpr: send failed: %s', [string(LastError)]);
+  Result := Rc = 1;
+end;
+
+procedure TZprGrpcBidiStream.CloseSend;
+begin
+  if FSendClosed then
+    Exit;
+  Check(zpr_grpc_bidi_close_send(FHandle));
+  FSendClosed := True;
+end;
+
+function TZprGrpcBidiStream.ReadInto(ABuffer: PByte; ACapacity: NativeUInt;
+  out ALength: NativeUInt): TZprReadResult;
+var
+  Rc: Integer;
+begin
+  Rc := zpr_grpc_bidi_read_into(FHandle, ABuffer, ACapacity, ALength);
+  case Rc of
+    1: Result := zrMessage;
+    0: Result := zrNone;
+    -2: Result := zrShortBuffer;
+  else
+    Result := zrError;
+  end;
+end;
+
+procedure TZprGrpcBidiStream.Buffer(ACapacity: NativeUInt);
+begin
+  Check(zpr_grpc_bidi_buffer(FHandle, ACapacity));
+end;
+
+{ TZprGrpcCall }
+
+constructor TZprGrpcCall.Create(AQueue: PCallQueue; AId: UInt64; const AMethodPath: UTF8String);
+begin
+  inherited Create;
+  FQueue := AQueue;
+  FId := AId;
+  FMethodPath := AMethodPath;
+end;
+
+destructor TZprGrpcCall.Destroy;
+begin
+  // 14 = UNAVAILABLE. See the note on the declaration: this is a backstop, not
+  // a licence to skip Complete.
+  if not FCompleted then
+    Complete(14, 'the handler ended without completing this call');
+  inherited Destroy;
+end;
+
+function TZprGrpcCall.Read(out AData: TBytes): TZprReadResult;
+var
+  Buf: TBytes;
+  Got: NativeUInt;
+  Rc: Integer;
+begin
+  SetLength(AData, 0);
+  // 64 KiB covers any ordinary request; a short buffer HOLDS the message, so the
+  // grow-and-retry below cannot lose one.
+  SetLength(Buf, 65536);
+  Got := 0;
+  repeat
+    Rc := zpr_grpc_call_read_into(FQueue, FId, BytesPtr(Buf), Length(Buf), Got);
+    if Rc = -2 then
+      SetLength(Buf, Got); // exactly what it asked for, then read again
+  until Rc <> -2;
+  case Rc of
+    1:
+      begin
+        SetLength(AData, Got);
+        if Got > 0 then
+          Move(Buf[0], AData[0], Got);
+        Result := zrMessage;
+      end;
+    0: Result := zrNone;
+    2: Result := zrClientDone;
+  else
+    Result := zrError;
+  end;
+end;
+
+function TZprGrpcCall.Write(const AData: TBytes): Boolean;
+var
+  Rc: Integer;
+begin
+  Rc := zpr_grpc_call_write(FQueue, FId, BytesPtr(AData), Length(AData));
+  if Rc < 0 then
+    raise EError.CreateFmt('zpr: write failed: %s', [string(LastError)]);
+  Result := Rc = 1;
+end;
+
+procedure TZprGrpcCall.Complete(AStatus: Integer; const AMessage: UTF8String);
+begin
+  if FCompleted then
+    Exit;
+  FCompleted := True;
+  zpr_grpc_call_complete(FQueue, FId, AStatus, Utf8PtrOrNil(AMessage));
+end;
+
+{ TZprGrpcQueuedServer }
+
+class function TZprGrpcQueuedServer.Start(const ABindAddr: UTF8String): TZprGrpcQueuedServer;
+var
+  H: PGrpcServerHandle;
+  Q: PCallQueue;
+begin
+  H := nil;
+  Q := nil;
+  Check(zpr_grpc_server_start_queued(Utf8Ptr(ABindAddr), H, Q));
+  Result := TZprGrpcQueuedServer.Create;
+  Result.FHandle := H;
+  Result.FQueue := Q;
+end;
+
+destructor TZprGrpcQueuedServer.Destroy;
+begin
+  Stop;
+  inherited Destroy;
+end;
+
+function TZprGrpcQueuedServer.Accept: TZprGrpcCall;
+var
+  CallId: UInt64;
+  Method: TBytes;
+  MethodLen: NativeUInt;
+  Rc: Integer;
+begin
+  Result := nil;
+  if FQueue = nil then
+    Exit;
+  CallId := 0;
+  MethodLen := 0;
+  SetLength(Method, 512);
+  repeat
+    Rc := zpr_grpc_accept(FQueue, CallId, BytesPtr(Method), Length(Method), MethodLen);
+    if Rc = -2 then
+      SetLength(Method, MethodLen); // the RPC stays queued; retry at the right size
+  until Rc <> -2;
+  if Rc <> 1 then
+    Exit;
+  SetLength(Method, MethodLen);
+  Result := TZprGrpcCall.Create(FQueue, CallId, UTF8String(PAnsiChar(BytesPtr(Method))));
+end;
+
+procedure TZprGrpcQueuedServer.Stop;
+begin
+  if FHandle <> nil then
+  begin
+    zpr_grpc_server_stop(FHandle);
+    FHandle := nil;
+  end;
+  if FQueue <> nil then
+  begin
+    zpr_grpc_queue_free(FQueue);
+    FQueue := nil;
+  end;
+end;
+
+function TZprGrpcQueuedServer.GetPending: NativeUInt;
+var
+  Live: NativeUInt;
+begin
+  Result := 0;
+  Live := 0;
+  if FQueue <> nil then
+    zpr_grpc_queue_stats(FQueue, Result, Live);
+end;
+
+function TZprGrpcQueuedServer.GetLive: NativeUInt;
+var
+  Pending: NativeUInt;
+begin
+  Result := 0;
+  Pending := 0;
+  if FQueue <> nil then
+    zpr_grpc_queue_stats(FQueue, Pending, Result);
+end;
+
+{ TZprTranscoder }
+
+class function TZprTranscoder.Start(const ABindAddr, AUpstream: UTF8String;
+  APool: TZprProtobufPool; ATimeoutMs: Cardinal): TZprTranscoder;
+var
+  H: PTranscodeHandle;
+begin
+  if APool = nil then
+    raise EError.Create('zpr: the transcoder routes by descriptor and needs a pool');
+  H := nil;
+  Check(zpr_transcode_start(Utf8Ptr(ABindAddr), Utf8Ptr(AUpstream), APool.Handle, ATimeoutMs, H));
+  Result := TZprTranscoder.Create;
+  Result.FHandle := H;
+end;
+
+destructor TZprTranscoder.Destroy;
+begin
+  Stop;
+  inherited Destroy;
+end;
+
+procedure TZprTranscoder.Stop;
+begin
+  if FHandle = nil then
+    Exit;
+  zpr_transcode_stop(FHandle);
+  FHandle := nil;
+end;
+
 
 initialization
 

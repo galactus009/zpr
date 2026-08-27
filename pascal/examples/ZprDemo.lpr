@@ -139,14 +139,11 @@ end;
 // no worker thread and nothing entering the host from a foreign thread.
 procedure DemoStreaming(APool: TZprProtobufPool);
 var
-  Stream: PGrpcClientStream;
+  Stream: TZprGrpcClientStream;
   Req: TBytes;
-  Status: Integer;
   Buf: array[0..65535] of Byte;
   Got: NativeUInt;
-  Rc, Reads, Spins: Integer;
-  Depth: NativeUInt;
-  Dropped: UInt64;
+  Reads, Spins: Integer;
 begin
   Head('gRPC server-streaming (ring-buffered, non-blocking)');
   if (GEndpoint = '') or (APool = nil) then
@@ -154,41 +151,45 @@ begin
     WriteLn('  skipped (needs an endpoint and a descriptor set)');
     Exit;
   end;
-  Req := APool.JsonToBinary('sapphire.v1.Empty', '{}');
-  if zpr_grpc_client_stream_open(PAnsiChar(GEndpoint),
-       '/sapphire.v1.MarketDataService/StreamSnapshots', nil,
-       PByte(Req), Length(Req), 5000, Stream, Status) <> 0 then
-  begin
-    WriteLn('  could not open: ', LastError);
-    Exit;
+  try
+    Req := APool.JsonToBinary('sapphire.v1.Empty', '{}');
+    Stream := TZprGrpcClient.OpenStream(GEndpoint,
+      '/sapphire.v1.MarketDataService/StreamSnapshots', Req, 5000);
+  except
+    on E: Exception do
+    begin
+      WriteLn('  could not open: ', E.Message);
+      Exit;
+    end;
   end;
   try
-    // 256 messages of slack. Full means the OLDEST is discarded — right for
-    // marks, wrong for anything whose successor does not carry what it said.
-    zpr_grpc_client_stream_buffer(Stream, 256);
+    // 256 messages of slack. Full discards the OLDEST — right for marks, wrong
+    // for anything whose successor does not carry what it said.
+    Stream.Buffer(256);
     Reads := 0;
     for Spins := 1 to 40 do
     begin
-      Rc := zpr_grpc_client_stream_read_into(Stream, @Buf[0], Length(Buf), Got);
-      if Rc = 1 then
-      begin
-        Inc(Reads);
-        if Reads = 1 then
-          WriteLn('  first message: ', Got, ' bytes');
-      end
-      else if Rc < 0 then
-      begin
-        WriteLn('  stream error: ', LastError);
-        Break;
+      case Stream.ReadInto(@Buf[0], Length(Buf), Got) of
+        zrMessage:
+          begin
+            Inc(Reads);
+            if Reads = 1 then
+              WriteLn('  first message: ', Got, ' bytes');
+          end;
+        zrError:
+          begin
+            WriteLn('  stream error: ', LastError);
+            Break;
+          end;
       end;
       Sleep(50); // a TTimer interval, in a console program
     end;
-    zpr_grpc_client_stream_stats(Stream, Depth, Dropped);
-    WriteLn('  read ', Reads, ' message(s); ring depth ', Depth, ', dropped ', Dropped);
-    if Dropped > 0 then
-      WriteLn('  ^ the host fell behind. This number is the only sign of it.');
+    WriteLn('  read ', Reads, ' message(s); ring depth ', Stream.Depth,
+            ', dropped ', Stream.Dropped);
+    if Stream.Dropped > 0 then
+      WriteLn('  ^ this program fell behind. That counter is the only sign of it.');
   finally
-    zpr_grpc_client_stream_cancel(Stream);
+    Stream.Free;
   end;
 end;
 
@@ -196,8 +197,7 @@ end;
 // Client-streaming is this with one read at the end.
 procedure DemoBidi;
 var
-  Bidi: PGrpcBidiStream;
-  Status: Integer;
+  Bidi: TZprGrpcBidiStream;
   Payload: TBytes;
 begin
   Head('gRPC bidirectional');
@@ -206,21 +206,24 @@ begin
     WriteLn('  skipped (no endpoint)');
     Exit;
   end;
-  if zpr_grpc_bidi_open(PAnsiChar(GEndpoint), '/sapphire.v1.HealthService/Ping',
-       nil, 8, 5000, Bidi, Status) <> 0 then
-  begin
-    WriteLn('  could not open (expected — Ping is not bidirectional): grpc-status=', Status);
-    Exit;
+  try
+    Bidi := TZprGrpcBidiStream.Open(GEndpoint, '/sapphire.v1.HealthService/Ping');
+  except
+    on E: Exception do
+    begin
+      WriteLn('  refused, as expected — Ping is not bidirectional: ', E.Message);
+      Exit;
+    end;
   end;
   try
     SetLength(Payload, 0);
-    zpr_grpc_bidi_send(Bidi, PByte(Payload), 0);
-    // ⚠ WITHOUT THIS A CLIENT-STREAMING SERVER NEVER ANSWERS: it is waiting for
-    // the end of the request stream to compute its single reply.
-    zpr_grpc_bidi_close_send(Bidi);
+    Bidi.Send(Payload);
+    // ⚠ WITHOUT THIS A CLIENT-STREAMING SERVER NEVER ANSWERS: it waits for the
+    // end of the request stream before computing its single reply.
+    Bidi.CloseSend;
     WriteLn('  sent one message and half-closed');
   finally
-    zpr_grpc_bidi_cancel(Bidi);
+    Bidi.Free;
   end;
 end;
 
@@ -231,49 +234,49 @@ procedure DemoQueuedServer;
 const
   Bind = '127.0.0.1:50077';
 var
-  Handle: PGrpcServerHandle;
-  Queue: PCallQueue;
-  CallId: UInt64;
-  Method: array[0..255] of Byte;
-  MethodLen, Got: NativeUInt;
-  Buf: array[0..4095] of Byte;
-  Rc, Spins: Integer;
-  Pending, Live: NativeUInt;
-  Reply: TBytes;
+  Server: TZprGrpcQueuedServer;
+  Call: TZprGrpcCall;
+  Req, Reply: TBytes;
+  Spins: Integer;
+  Res: TZprReadResult;
 begin
   Head('gRPC server (queued — no callback, no worker thread)');
-  if zpr_grpc_server_start_queued(Bind, Handle, Queue) <> 0 then
-  begin
-    WriteLn('  could not bind ', Bind, ': ', LastError);
-    Exit;
+  try
+    Server := TZprGrpcQueuedServer.Start(Bind);
+  except
+    on E: Exception do
+    begin
+      WriteLn('  could not bind ', Bind, ': ', E.Message);
+      Exit;
+    end;
   end;
   try
     WriteLn('  listening on ', Bind, ' — try: grpcurl -plaintext ', Bind, ' any.Service/Method');
     for Spins := 1 to 30 do
     begin
-      Rc := zpr_grpc_accept(Queue, CallId, @Method[0], Length(Method), MethodLen);
-      if Rc = 1 then
-      begin
-        WriteLn('  accepted #', CallId, ' ', PAnsiChar(@Method[0]));
-        // Drain the request, answer once, and ALWAYS complete.
-        repeat
-          Rc := zpr_grpc_call_read_into(Queue, CallId, @Buf[0], Length(Buf), Got);
-          if Rc = 1 then WriteLn('    request message: ', Got, ' bytes');
-        until Rc <> 1;
-        SetLength(Reply, 0);
-        zpr_grpc_call_write(Queue, CallId, PByte(Reply), 0);
-        // ⚠ AN ID NEVER COMPLETED LEAVES THE CLIENT WAITING ON TRAILERS THAT
-        // NEVER COME — the call hangs rather than failing.
-        zpr_grpc_call_complete(Queue, CallId, 0, nil);
-        WriteLn('    completed OK');
-      end;
+      Call := Server.Accept;
+      if Call <> nil then
+        try
+          WriteLn('  accepted #', Call.Id, ' ', string(Call.MethodPath));
+          repeat
+            Res := Call.Read(Req);
+            if Res = zrMessage then
+              WriteLn('    request message: ', Length(Req), ' bytes');
+          until Res <> zrMessage;
+          SetLength(Reply, 0);
+          Call.Write(Reply);
+          Call.Complete(0);
+          WriteLn('    completed OK');
+        finally
+          // Freeing completes the call if we did not — a call left incomplete
+          // HANGS its client rather than failing it.
+          Call.Free;
+        end;
       Sleep(100);
     end;
-    zpr_grpc_queue_stats(Queue, Pending, Live);
-    WriteLn('  queue: ', Pending, ' pending, ', Live, ' live (live should be 0)');
+    WriteLn('  queue: ', Server.Pending, ' pending, ', Server.Live, ' live (live should be 0)');
   finally
-    zpr_grpc_server_stop(Handle);
-    zpr_grpc_queue_free(Queue);
+    Server.Free;
   end;
 end;
 
@@ -284,7 +287,7 @@ procedure DemoTranscoder(APool: TZprProtobufPool);
 const
   Bind = '127.0.0.1:8098';
 var
-  Handle: PTranscodeHandle;
+  Transcoder: TZprTranscoder;
 begin
   Head('JSON -> gRPC transcoder');
   if (GEndpoint = '') or (APool = nil) then
@@ -292,18 +295,22 @@ begin
     WriteLn('  skipped (needs an endpoint and a descriptor set)');
     Exit;
   end;
-  if zpr_transcode_start(Bind, PAnsiChar(GEndpoint), APool.Handle, 5000, Handle) <> 0 then
-  begin
-    WriteLn('  could not start: ', LastError);
-    Exit;
+  try
+    Transcoder := TZprTranscoder.Start(Bind, GEndpoint, APool);
+  except
+    on E: Exception do
+    begin
+      WriteLn('  could not start: ', E.Message);
+      Exit;
+    end;
   end;
   try
     WriteLn('  transcoding http://', Bind, ' -> ', GEndpoint);
-    WriteLn('  try: curl -X POST http://', Bind, '/sapphire.v1.HealthService/Ping \');
-    WriteLn('            -H ''Content-Type: application/json'' -d ''{}''');
+    WriteLn('  try: curl -X POST http://', Bind, '/sapphire.v1.HealthService/Ping');
+    WriteLn('       -H ''Content-Type: application/json'' -d ''{}'');
     Sleep(15000);
   finally
-    zpr_transcode_stop(Handle);
+    Transcoder.Free;
   end;
 end;
 
