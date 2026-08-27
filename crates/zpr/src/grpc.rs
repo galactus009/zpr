@@ -1154,6 +1154,109 @@ pub(crate) async fn call_unary_bytes(
     }
 }
 
+/// protobuf bytes straight to a JSON **value handle**, with no text in between.
+///
+/// ⚠ THIS IS THE ONE TO USE ON A HOT PATH, and the reason is a step that should
+/// never have been there. `zpr_protobuf_binary_to_json` renders the message to a
+/// JSON STRING; a caller that then wants to read fields hands that string to
+/// `zpr_json_parse`, which parses it straight back into the same tree it was
+/// just serialised from. Two full passes over the data to arrive where the first
+/// one already was.
+///
+/// This decodes the protobuf and builds the value directly. On a per-tick path
+/// that is most of the cost removed, and the caller reads fields exactly as
+/// before — the handle is an ordinary one, freed with `zpr_json_free`.
+///
+/// Returns NULL on failure; check `zpr_last_error()`.
+#[no_mangle]
+pub extern "C" fn zpr_protobuf_binary_to_json_value(
+    pool: *mut DescriptorPoolHandle,
+    message_type: *const c_char,
+    data: *const u8,
+    data_len: usize,
+) -> *mut crate::json::JsonValue {
+    ffi::guard(std::ptr::null_mut(), move || {
+        if pool.is_null() {
+            ffi::set_last_error("null descriptor pool handle");
+            return std::ptr::null_mut();
+        }
+        let type_name = match unsafe { cstr_to_str(message_type) } {
+            Ok(s) => s,
+            Err(e) => { ffi::set_last_error(e); return std::ptr::null_mut(); }
+        };
+        let Some(desc) = unsafe { &*pool }.0.get_message_by_name(type_name) else {
+            ffi::set_last_error(format!("no message type {type_name:?} in the descriptor set"));
+            return std::ptr::null_mut();
+        };
+        let bytes = if data.is_null() || data_len == 0 {
+            &[][..]
+        } else {
+            unsafe { std::slice::from_raw_parts(data, data_len) }
+        };
+        let msg = match DynamicMessage::decode(desc, bytes) {
+            Ok(m) => m,
+            Err(e) => {
+                ffi::set_last_error(format!("bytes are not a valid {type_name}: {e}"));
+                return std::ptr::null_mut();
+            }
+        };
+        // 64-bit integers as NUMBERS, matching zpr_protobuf_binary_to_json.
+        // protojson quotes them by default, which is correct JSON and surprises
+        // every caller that then has to parse a number back out of a string.
+        let opts = prost_reflect::SerializeOptions::new().stringify_64_bit_integers(false);
+        match msg.serialize_with_options(serde_json::value::Serializer, &opts) {
+            Ok(v) => Box::into_raw(Box::new(crate::json::JsonValue(v))),
+            Err(e) => {
+                ffi::set_last_error(format!("could not build a JSON value from {type_name}: {e}"));
+                std::ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// The reverse: a JSON value handle straight to protobuf bytes, no text.
+///
+/// The value is BORROWED — the caller still owns it and still frees it with
+/// `zpr_json_free`.
+#[no_mangle]
+pub extern "C" fn zpr_protobuf_json_value_to_binary(
+    pool: *mut DescriptorPoolHandle,
+    message_type: *const c_char,
+    value: *const crate::json::JsonValue,
+    out: *mut ZprBuffer,
+) -> i32 {
+    if !out.is_null() {
+        unsafe { *out = ZprBuffer::empty() };
+    }
+    ffi::guard(ZPR_ERR, move || {
+        if pool.is_null() || value.is_null() {
+            ffi::set_last_error("null descriptor pool or JSON value handle");
+            return ZPR_ERR;
+        }
+        let type_name = match unsafe { cstr_to_str(message_type) } {
+            Ok(s) => s,
+            Err(e) => { ffi::set_last_error(e); return ZPR_ERR; }
+        };
+        let Some(desc) = unsafe { &*pool }.0.get_message_by_name(type_name) else {
+            ffi::set_last_error(format!("no message type {type_name:?} in the descriptor set"));
+            return ZPR_ERR;
+        };
+        let v = unsafe { &*value }.0.clone();
+        match DynamicMessage::deserialize(desc, v) {
+            Ok(msg) => {
+                if !out.is_null() {
+                    unsafe { *out = ZprBuffer::from_vec(msg.encode_to_vec()) };
+                }
+                ZPR_OK
+            }
+            Err(e) => {
+                ffi::set_last_error(format!("JSON does not match {type_name}: {e}"));
+                ZPR_ERR
+            }
+        }
+    })
+}
+
 /// Loads a `FileDescriptorSet` (the binary output of
 /// `protoc --descriptor_set_out=out.bin --include_imports your.proto`).
 /// Returns NULL on failure — check `zpr_last_error()`.

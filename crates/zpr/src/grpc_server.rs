@@ -114,6 +114,27 @@ pub struct CallQueue {
     /// Accepted and not yet completed, by id.
     live: Mutex<HashMap<u64, LiveCall>>,
     next_id: AtomicU64,
+    /// How many RPCs may wait to be accepted before new ones are REFUSED.
+    ///
+    /// ⚠ AN UNBOUNDED QUEUE IS NOT PATIENCE, IT IS A SLOW FAILURE. A host that
+    /// stops accepting — stalled, wedged, or just slower than the load — sees
+    /// this grow until memory runs out, while every queued caller waits on a
+    /// request that was never going to be served. Refusing at a limit turns that
+    /// into RESOURCE_EXHAUSTED, which a client can retry, log or back off on.
+    max_pending: AtomicU64,
+    /// How long an ACCEPTED call may go uncompleted before the reaper answers
+    /// it. 0 disables the reaper.
+    ///
+    /// ⚠ WITHOUT THIS A HOST BUG IS A PERMANENT LEAK. A call the host never
+    /// completes holds its channels forever and leaves its client waiting on
+    /// trailers that never arrive — the request hangs rather than fails, and
+    /// `live` grows for the life of the process.
+    deadline_ms: AtomicU64,
+    /// Counters. `refused` and `reaped` are the two that say something is wrong.
+    accepted: AtomicU64,
+    completed: AtomicU64,
+    refused: AtomicU64,
+    reaped: AtomicU64,
 }
 
 struct LiveCall {
@@ -124,6 +145,8 @@ struct LiveCall {
     /// Same rule as the client: a short buffer is a resize, never a lost message.
     pending_msg: Option<Vec<u8>>,
     client_done: bool,
+    /// When the reaper gives up on this call. See `CallQueue::deadline`.
+    expires_at: std::time::Instant,
 }
 
 impl CallQueue {
@@ -132,6 +155,15 @@ impl CallQueue {
             pending: Mutex::new(VecDeque::new()),
             live: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
+            // 1024 waiting RPCs and a 30s completion deadline: generous for a
+            // host polling on a timer, and both are far below "until memory
+            // runs out", which is what no limit at all means.
+            max_pending: AtomicU64::new(1024),
+            deadline_ms: AtomicU64::new(30_000),
+            accepted: AtomicU64::new(0),
+            completed: AtomicU64::new(0),
+            refused: AtomicU64::new(0),
+            reaped: AtomicU64::new(0),
         }
     }
 }
@@ -139,6 +171,10 @@ impl CallQueue {
 /// An RPC arrived but the host never accepted or completed it before the server
 /// stopped. Answered so a client is refused rather than left hanging.
 const GRPC_UNAVAILABLE: i32 = 14;
+/// The queue is full: the host is not accepting fast enough.
+const GRPC_RESOURCE_EXHAUSTED: i32 = 8;
+/// The host accepted a call and never completed it inside the deadline.
+const GRPC_DEADLINE_EXCEEDED: i32 = 4;
 
 /// Opaque per-RPC stream, bridging the async connection task and the
 /// synchronous handler thread. Free implicitly when the handler returns.
@@ -430,6 +466,23 @@ async fn handle_queued(
 
     tokio::spawn(pump_inbound(req.into_body(), inbound_tx));
 
+    // ⚠ REFUSED AT THE DOOR, BEFORE ANY STATE IS ALLOCATED. A queue that is
+    // already full means the host is not keeping up; adding to it makes that
+    // worse and tells the caller nothing. RESOURCE_EXHAUSTED is something a
+    // client can act on.
+    {
+        let pending = queue.pending.lock_ok();
+        if pending.len() as u64 >= queue.max_pending.load(Ordering::Relaxed) {
+            queue.refused.fetch_add(1, Ordering::Relaxed);
+            drop(pending);
+            return Ok(immediate_error(
+                GRPC_RESOURCE_EXHAUSTED,
+                "the server has more calls queued than it can accept",
+            ));
+        }
+    }
+
+    let ms = queue.deadline_ms.load(Ordering::Relaxed);
     let id = queue.next_id.fetch_add(1, Ordering::Relaxed);
     queue.live.lock_ok().insert(
         id,
@@ -439,6 +492,8 @@ async fn handle_queued(
             status_tx: Some(status_tx),
             pending_msg: None,
             client_done: false,
+            expires_at: std::time::Instant::now()
+                + std::time::Duration::from_millis(if ms == 0 { u64::MAX / 4 } else { ms }),
         },
     );
     queue.pending.lock_ok().push_back((id, path));
@@ -506,6 +561,8 @@ pub extern "C" fn zpr_grpc_server_start_queued(
 
         let queue = Arc::new(CallQueue::new());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let reaper_shutdown = shutdown_tx.subscribe();
+        let reaper_queue = Arc::clone(&queue);
         let service = PassthroughService { dispatch: Dispatch::Queued(Arc::clone(&queue)) };
 
         let thread = std::thread::Builder::new().name("zpr-grpc-server".into()).spawn(move || {
@@ -515,6 +572,7 @@ pub extern "C" fn zpr_grpc_server_start_queued(
             };
             rt.block_on(async move {
                 let Ok(listener) = TcpListener::from_std(std_listener) else { return };
+                tokio::spawn(reap_loop(reaper_queue, reaper_shutdown));
                 accept_loop(listener, service, shutdown_rx).await;
             });
         });
@@ -535,6 +593,119 @@ pub extern "C" fn zpr_grpc_server_start_queued(
                 ZPR_ERR
             }
         }
+    })
+}
+
+/// Answers calls the host accepted and never completed.
+///
+/// ⚠ THIS EXISTS BECAUSE THE ALTERNATIVE IS A LEAK WITH A CLIENT ON THE END OF
+/// IT. Every accepted call holds two channels and a status sender; a host that
+/// returns early, throws, or simply forgets leaves all three alive and its
+/// caller waiting on trailers that never arrive. The request does not fail — it
+/// HANGS, which is harder to notice and harder to diagnose. Over a long run
+/// `live` only grows.
+///
+/// Sweeping once a second is enough: this is a backstop for a host bug, not a
+/// scheduler, and the deadline it enforces is measured in tens of seconds.
+async fn reap_loop(queue: Arc<CallQueue>, mut shutdown: watch::Receiver<bool>) {
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => return,
+            _ = tick.tick() => {
+                if queue.deadline_ms.load(Ordering::Relaxed) == 0 {
+                    continue;
+                }
+                let now = std::time::Instant::now();
+                let mut expired: Vec<LiveCall> = Vec::new();
+                {
+                    let mut live = queue.live.lock_ok();
+                    let ids: Vec<u64> = live
+                        .iter()
+                        .filter(|(_, c)| c.expires_at <= now)
+                        .map(|(id, _)| *id)
+                        .collect();
+                    for id in ids {
+                        if let Some(c) = live.remove(&id) {
+                            expired.push(c);
+                        }
+                    }
+                }
+                // Sent OUTSIDE the lock: a status send wakes the connection task,
+                // and holding the map while that happens is how a sweep starts
+                // contending with every accept and read on the server.
+                for mut c in expired {
+                    if let Some(tx) = c.status_tx.take() {
+                        let _ = tx.send((
+                            GRPC_DEADLINE_EXCEEDED,
+                            "the server accepted this call and did not complete it in time".into(),
+                        ));
+                    }
+                    queue.reaped.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+}
+
+/// Sets the two limits that stop a host bug becoming an outage.
+///
+/// `max_pending` — waiting RPCs before new ones are refused RESOURCE_EXHAUSTED.
+/// `deadline_ms` — how long an accepted call may go uncompleted; 0 disables the
+/// reaper, which is only reasonable if the host is provably always completing.
+///
+/// Defaults are 1024 and 30_000. Both take effect on the NEXT call; calls
+/// already accepted keep the deadline they were stamped with.
+#[no_mangle]
+pub extern "C" fn zpr_grpc_queue_configure(
+    queue: *mut CallQueue,
+    max_pending: u64,
+    deadline_ms: u64,
+) -> i32 {
+    if queue.is_null() {
+        ffi::set_last_error("null queue passed to zpr_grpc_queue_configure");
+        return ZPR_ERR;
+    }
+    ffi::guard(ZPR_ERR, move || {
+        let q = unsafe { &*queue };
+        if max_pending == 0 {
+            ffi::set_last_error("a max_pending of 0 would refuse every call");
+            return ZPR_ERR;
+        }
+        q.max_pending.store(max_pending, Ordering::Relaxed);
+        q.deadline_ms.store(deadline_ms, Ordering::Relaxed);
+        ZPR_OK
+    })
+}
+
+/// Lifetime counters. `refused` and `reaped` are the two that mean something is
+/// wrong: the first says the host is not accepting fast enough, the second that
+/// it is accepting calls and not completing them.
+#[no_mangle]
+pub extern "C" fn zpr_grpc_queue_counters(
+    queue: *mut CallQueue,
+    out_accepted: *mut u64,
+    out_completed: *mut u64,
+    out_refused: *mut u64,
+    out_reaped: *mut u64,
+) -> i32 {
+    if queue.is_null() {
+        ffi::set_last_error("null queue passed to zpr_grpc_queue_counters");
+        return ZPR_ERR;
+    }
+    ffi::guard(ZPR_ERR, move || {
+        let q = unsafe { &*queue };
+        for (p, v) in [
+            (out_accepted, &q.accepted),
+            (out_completed, &q.completed),
+            (out_refused, &q.refused),
+            (out_reaped, &q.reaped),
+        ] {
+            if !p.is_null() {
+                unsafe { *p = v.load(Ordering::Relaxed) };
+            }
+        }
+        ZPR_OK
     })
 }
 
@@ -569,6 +740,7 @@ pub extern "C" fn zpr_grpc_accept(
         if !out_call_id.is_null() {
             unsafe { *out_call_id = id };
         }
+        q.accepted.fetch_add(1, Ordering::Relaxed);
         ZPR_CALL_MESSAGE
     })
 }
@@ -705,6 +877,7 @@ pub extern "C" fn zpr_grpc_call_complete(
         if let Some(tx) = call.status_tx.take() {
             let _ = tx.send((grpc_status, msg));
         }
+        q.completed.fetch_add(1, Ordering::Relaxed);
         ZPR_OK
     })
 }

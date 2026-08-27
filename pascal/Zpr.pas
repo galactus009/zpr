@@ -217,6 +217,16 @@ type
 
     function JsonToBinary(const AMessageType, AJson: UTF8String): TBytes;
     function BinaryToJson(const AMessageType: UTF8String; const AData: TBytes): UTF8String;
+
+    // The same conversions with NO TEXT in the middle — use these on a hot path.
+    //
+    // ⚠ BinaryToJson RENDERS A STRING, and a caller who then wants to read
+    // fields hands it to TZprJson.Parse, which parses it straight back into the
+    // tree it was just serialised from. Two full passes to arrive where the
+    // first one already was. These build the value directly; on a per-tick path
+    // that is most of the cost gone, and the result is an ordinary TZprJson.
+    function BinaryToJsonValue(const AMessageType: UTF8String; const AData: TBytes): TZprJson;
+    function JsonValueToBinary(const AMessageType: UTF8String; AValue: TZprJson): TBytes;
   end;
 
 // ---------------------------------------------------------------------
@@ -365,6 +375,18 @@ type
     function Accept: TZprGrpcCall;
 
     procedure Stop;
+
+    // The two limits that stop a bug in YOUR code becoming an outage.
+    // AMaxPending: waiting RPCs before new ones are refused RESOURCE_EXHAUSTED.
+    // ADeadlineMs: how long an accepted call may go uncompleted before the
+    // server answers it DEADLINE_EXCEEDED and forgets it; 0 disables that.
+    // Defaults are 1024 and 30000.
+    procedure Configure(AMaxPending: UInt64 = 1024; ADeadlineMs: UInt64 = 30000);
+
+    // Lifetime totals. ⚠ Refused AND Reaped ARE THE TWO THAT MEAN SOMETHING IS
+    // WRONG: the first says you are not accepting fast enough, the second that
+    // you are accepting calls and not completing them.
+    procedure Counters(out AAccepted, ACompleted, ARefused, AReaped: UInt64);
 
     property Pending: NativeUInt read GetPending;
     // Accepted and not yet completed. ⚠ A NUMBER THAT ONLY GROWS IS A LEAK —
@@ -595,6 +617,10 @@ type
     out Output: TZprBuffer): Int32; cdecl;
   Tzpr_protobuf_binary_to_json = function(Pool: PDescriptorPool; MessageType: PAnsiChar;
     Data: PByte; DataLen: NativeUInt): PAnsiChar; cdecl;
+  Tzpr_protobuf_binary_to_json_value = function(Pool: PDescriptorPool; MessageType: PAnsiChar;
+    Data: PByte; DataLen: NativeUInt): PJsonValue; cdecl;
+  Tzpr_protobuf_json_value_to_binary = function(Pool: PDescriptorPool; MessageType: PAnsiChar;
+    Value: PJsonValue; out Output: TZprBuffer): Int32; cdecl;
 
   Tzpr_grpc_stream_read = function(Stream: PGrpcStream; out Output: TZprBuffer): Int32; cdecl;
   Tzpr_grpc_stream_write = function(Stream: PGrpcStream; Data: PByte; Len: NativeUInt): Int32; cdecl;
@@ -614,6 +640,9 @@ type
   Tzpr_grpc_queue_stats = function(Queue: PCallQueue; out OutPending: NativeUInt;
     out OutLive: NativeUInt): Int32; cdecl;
   Tzpr_grpc_queue_free = procedure(Queue: PCallQueue); cdecl;
+  Tzpr_grpc_queue_configure = function(Queue: PCallQueue; MaxPending, DeadlineMs: UInt64): Int32; cdecl;
+  Tzpr_grpc_queue_counters = function(Queue: PCallQueue; out OutAccepted, OutCompleted,
+    OutRefused, OutReaped: UInt64): Int32; cdecl;
 
   Tzpr_http_set_proxy = function(ProxyUrl: PAnsiChar): Int32; cdecl;
   Tzpr_http_request = function(Method, Url, HeadersJson: PAnsiChar; Body: PByte;
@@ -703,6 +732,10 @@ function zpr_protobuf_json_to_binary(Pool: PDescriptorPool; MessageType, Json: P
     out Output: TZprBuffer): Int32; cdecl; external name 'zpr_protobuf_json_to_binary';
 function zpr_protobuf_binary_to_json(Pool: PDescriptorPool; MessageType: PAnsiChar;
     Data: PByte; DataLen: NativeUInt): PAnsiChar; cdecl; external name 'zpr_protobuf_binary_to_json';
+function zpr_protobuf_binary_to_json_value(Pool: PDescriptorPool; MessageType: PAnsiChar;
+    Data: PByte; DataLen: NativeUInt): PJsonValue; cdecl; external name 'zpr_protobuf_binary_to_json_value';
+function zpr_protobuf_json_value_to_binary(Pool: PDescriptorPool; MessageType: PAnsiChar;
+    Value: PJsonValue; out Output: TZprBuffer): Int32; cdecl; external name 'zpr_protobuf_json_value_to_binary';
 function zpr_grpc_stream_read(Stream: PGrpcStream; out Output: TZprBuffer): Int32; cdecl; external name 'zpr_grpc_stream_read';
 function zpr_grpc_stream_write(Stream: PGrpcStream; Data: PByte; Len: NativeUInt): Int32; cdecl; external name 'zpr_grpc_stream_write';
 function zpr_grpc_server_start(BindAddr: PAnsiChar; Handler: TZprGrpcHandlerProc;
@@ -720,6 +753,9 @@ function zpr_grpc_call_complete(Queue: PCallQueue; CallId: UInt64; GrpcStatus: I
 function zpr_grpc_queue_stats(Queue: PCallQueue; out OutPending: NativeUInt;
     out OutLive: NativeUInt): Int32; cdecl; external name 'zpr_grpc_queue_stats';
 procedure zpr_grpc_queue_free(Queue: PCallQueue); cdecl; external name 'zpr_grpc_queue_free';
+function zpr_grpc_queue_configure(Queue: PCallQueue; MaxPending, DeadlineMs: UInt64): Int32; cdecl; external name 'zpr_grpc_queue_configure';
+function zpr_grpc_queue_counters(Queue: PCallQueue; out OutAccepted, OutCompleted,
+    OutRefused, OutReaped: UInt64): Int32; cdecl; external name 'zpr_grpc_queue_counters';
 function zpr_http_set_proxy(ProxyUrl: PAnsiChar): Int32; cdecl; external name 'zpr_http_set_proxy';
 function zpr_http_request(Method, Url, HeadersJson: PAnsiChar; Body: PByte;
     BodyLen: NativeUInt; TimeoutMs: UInt32; out OutStatus: UInt16;
@@ -791,6 +827,10 @@ function zpr_protobuf_json_to_binary(Pool: PDescriptorPool; MessageType, Json: P
     out Output: TZprBuffer): Int32; cdecl; external ZPR_LIB name 'zpr_protobuf_json_to_binary';
 function zpr_protobuf_binary_to_json(Pool: PDescriptorPool; MessageType: PAnsiChar;
     Data: PByte; DataLen: NativeUInt): PAnsiChar; cdecl; external ZPR_LIB name 'zpr_protobuf_binary_to_json';
+function zpr_protobuf_binary_to_json_value(Pool: PDescriptorPool; MessageType: PAnsiChar;
+    Data: PByte; DataLen: NativeUInt): PJsonValue; cdecl; external ZPR_LIB name 'zpr_protobuf_binary_to_json_value';
+function zpr_protobuf_json_value_to_binary(Pool: PDescriptorPool; MessageType: PAnsiChar;
+    Value: PJsonValue; out Output: TZprBuffer): Int32; cdecl; external ZPR_LIB name 'zpr_protobuf_json_value_to_binary';
 function zpr_grpc_stream_read(Stream: PGrpcStream; out Output: TZprBuffer): Int32; cdecl; external ZPR_LIB name 'zpr_grpc_stream_read';
 function zpr_grpc_stream_write(Stream: PGrpcStream; Data: PByte; Len: NativeUInt): Int32; cdecl; external ZPR_LIB name 'zpr_grpc_stream_write';
 function zpr_grpc_server_start(BindAddr: PAnsiChar; Handler: TZprGrpcHandlerProc;
@@ -808,6 +848,9 @@ function zpr_grpc_call_complete(Queue: PCallQueue; CallId: UInt64; GrpcStatus: I
 function zpr_grpc_queue_stats(Queue: PCallQueue; out OutPending: NativeUInt;
     out OutLive: NativeUInt): Int32; cdecl; external ZPR_LIB name 'zpr_grpc_queue_stats';
 procedure zpr_grpc_queue_free(Queue: PCallQueue); cdecl; external ZPR_LIB name 'zpr_grpc_queue_free';
+function zpr_grpc_queue_configure(Queue: PCallQueue; MaxPending, DeadlineMs: UInt64): Int32; cdecl; external ZPR_LIB name 'zpr_grpc_queue_configure';
+function zpr_grpc_queue_counters(Queue: PCallQueue; out OutAccepted, OutCompleted,
+    OutRefused, OutReaped: UInt64): Int32; cdecl; external ZPR_LIB name 'zpr_grpc_queue_counters';
 function zpr_http_set_proxy(ProxyUrl: PAnsiChar): Int32; cdecl; external ZPR_LIB name 'zpr_http_set_proxy';
 function zpr_http_request(Method, Url, HeadersJson: PAnsiChar; Body: PByte;
     BodyLen: NativeUInt; TimeoutMs: UInt32; out OutStatus: UInt16;
@@ -860,6 +903,8 @@ function zpr_json_object_set(Obj: PJsonValue; Key: PAnsiChar; Value: PJsonValue)
   zpr_protobuf_pool_free: Tzpr_protobuf_pool_free;
   zpr_protobuf_json_to_binary: Tzpr_protobuf_json_to_binary;
   zpr_protobuf_binary_to_json: Tzpr_protobuf_binary_to_json;
+  zpr_protobuf_binary_to_json_value: Tzpr_protobuf_binary_to_json_value;
+  zpr_protobuf_json_value_to_binary: Tzpr_protobuf_json_value_to_binary;
 
   zpr_grpc_stream_read: Tzpr_grpc_stream_read;
   zpr_grpc_stream_write: Tzpr_grpc_stream_write;
@@ -873,6 +918,8 @@ function zpr_json_object_set(Obj: PJsonValue; Key: PAnsiChar; Value: PJsonValue)
   zpr_grpc_call_complete: Tzpr_grpc_call_complete;
   zpr_grpc_queue_stats: Tzpr_grpc_queue_stats;
   zpr_grpc_queue_free: Tzpr_grpc_queue_free;
+  zpr_grpc_queue_configure: Tzpr_grpc_queue_configure;
+  zpr_grpc_queue_counters: Tzpr_grpc_queue_counters;
 
   zpr_http_set_proxy: Tzpr_http_set_proxy;
   zpr_http_request: Tzpr_http_request;
@@ -991,6 +1038,8 @@ begin
     zpr_protobuf_pool_free := Tzpr_protobuf_pool_free(Resolve('zpr_protobuf_pool_free'));
     zpr_protobuf_json_to_binary := Tzpr_protobuf_json_to_binary(Resolve('zpr_protobuf_json_to_binary'));
     zpr_protobuf_binary_to_json := Tzpr_protobuf_binary_to_json(Resolve('zpr_protobuf_binary_to_json'));
+    zpr_protobuf_binary_to_json_value := Tzpr_protobuf_binary_to_json_value(Resolve('zpr_protobuf_binary_to_json_value'));
+    zpr_protobuf_json_value_to_binary := Tzpr_protobuf_json_value_to_binary(Resolve('zpr_protobuf_json_value_to_binary'));
 
     zpr_grpc_stream_read := Tzpr_grpc_stream_read(Resolve('zpr_grpc_stream_read'));
     zpr_grpc_stream_write := Tzpr_grpc_stream_write(Resolve('zpr_grpc_stream_write'));
@@ -1004,6 +1053,8 @@ begin
     zpr_grpc_call_complete := Tzpr_grpc_call_complete(Resolve('zpr_grpc_call_complete'));
     zpr_grpc_queue_stats := Tzpr_grpc_queue_stats(Resolve('zpr_grpc_queue_stats'));
     zpr_grpc_queue_free := Tzpr_grpc_queue_free(Resolve('zpr_grpc_queue_free'));
+    zpr_grpc_queue_configure := Tzpr_grpc_queue_configure(Resolve('zpr_grpc_queue_configure'));
+    zpr_grpc_queue_counters := Tzpr_grpc_queue_counters(Resolve('zpr_grpc_queue_counters'));
 
     zpr_http_set_proxy := Tzpr_http_set_proxy(Resolve('zpr_http_set_proxy'));
     zpr_http_request := Tzpr_http_request(Resolve('zpr_http_request'));
@@ -1548,6 +1599,30 @@ begin
   FHandle := nil;
 end;
 
+function TZprProtobufPool.BinaryToJsonValue(const AMessageType: UTF8String;
+  const AData: TBytes): TZprJson;
+var
+  H: PJsonValue;
+begin
+  H := zpr_protobuf_binary_to_json_value(FHandle, Utf8Ptr(AMessageType),
+         BytesPtr(AData), Length(AData));
+  if H = nil then
+    raise EError.CreateFmt('zpr: %s', [string(LastError)]);
+  Result := TZprJson.CreateFromHandle(H, True);
+end;
+
+function TZprProtobufPool.JsonValueToBinary(const AMessageType: UTF8String;
+  AValue: TZprJson): TBytes;
+var
+  Buf: TZprBuffer;
+begin
+  if AValue = nil then
+    raise EError.Create('zpr: nil JSON value passed to JsonValueToBinary');
+  // The value is BORROWED — AValue still owns its handle and still frees it.
+  Check(zpr_protobuf_json_value_to_binary(FHandle, Utf8Ptr(AMessageType), AValue.FHandle, Buf));
+  Result := BufferToBytes(Buf);
+end;
+
 { TZprGrpcClientStream — the buffered half }
 
 function TZprGrpcClientStream.ReadInto(ABuffer: PByte; ACapacity: NativeUInt;
@@ -1798,6 +1873,21 @@ begin
   Pending := 0;
   if FQueue <> nil then
     zpr_grpc_queue_stats(FQueue, Pending, Result);
+end;
+
+procedure TZprGrpcQueuedServer.Configure(AMaxPending: UInt64; ADeadlineMs: UInt64);
+begin
+  if FQueue = nil then
+    Exit;
+  Check(zpr_grpc_queue_configure(FQueue, AMaxPending, ADeadlineMs));
+end;
+
+procedure TZprGrpcQueuedServer.Counters(out AAccepted, ACompleted, ARefused, AReaped: UInt64);
+begin
+  AAccepted := 0; ACompleted := 0; ARefused := 0; AReaped := 0;
+  if FQueue = nil then
+    Exit;
+  zpr_grpc_queue_counters(FQueue, AAccepted, ACompleted, ARefused, AReaped);
 end;
 
 { TZprTranscoder }
