@@ -10,7 +10,7 @@ use std::time::Duration;
 use reqwest::Client;
 use serde_json::Value;
 
-use crate::ffi::{self, cstr_to_str, runtime, string_to_cstring_ptr, ZprBuffer, ZprResult, ZPR_ERR, ZPR_OK};
+use crate::ffi::{LockExt, self, cstr_to_str, runtime, string_to_cstring_ptr, ZprBuffer, ZprResult, ZPR_ERR, ZPR_OK};
 
 static CLIENT: OnceLock<Client> = OnceLock::new();
 static PROXY_OVERRIDE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
@@ -30,7 +30,7 @@ pub extern "C" fn zpr_http_set_proxy(proxy_url: *const c_char) -> i32 {
         return ZPR_ERR;
     }
     ffi::guard(ZPR_ERR, move || {
-        let mut slot = PROXY_OVERRIDE.get_or_init(Default::default).lock().unwrap();
+        let mut slot = PROXY_OVERRIDE.get_or_init(Default::default).lock_ok();
         if proxy_url.is_null() {
             *slot = Some(String::new()); // sentinel: explicit "no proxy"
             return ZPR_OK;
@@ -58,7 +58,7 @@ fn client() -> &'static Client {
         runtime().block_on(async {
             let mut builder = Client::builder();
             if let Some(slot) = PROXY_OVERRIDE.get() {
-                match slot.lock().unwrap().as_deref() {
+                match slot.lock_ok().as_deref() {
                     Some("") => builder = builder.no_proxy(),
                     Some(url) => {
                         if let Ok(proxy) = reqwest::Proxy::all(url) {

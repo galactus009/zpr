@@ -30,7 +30,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::ffi::{self, cstr_to_str, ZprBuffer, ZPR_ERR, ZPR_OK};
+use crate::ffi::{LockExt, self, cstr_to_str, ZprBuffer, ZPR_ERR, ZPR_OK};
 
 /// Callback a Pascal program registers to handle every incoming gRPC call,
 /// unary or streaming alike.
@@ -431,7 +431,7 @@ async fn handle_queued(
     tokio::spawn(pump_inbound(req.into_body(), inbound_tx));
 
     let id = queue.next_id.fetch_add(1, Ordering::Relaxed);
-    queue.live.lock().unwrap().insert(
+    queue.live.lock_ok().insert(
         id,
         LiveCall {
             inbound_rx,
@@ -441,7 +441,7 @@ async fn handle_queued(
             client_done: false,
         },
     );
-    queue.pending.lock().unwrap().push_back((id, path));
+    queue.pending.lock_ok().push_back((id, path));
 
     let body = OutboundBody { rx: outbound_rx, status_rx, state: OutboundState::Streaming };
     Ok(http::Response::builder()
@@ -558,7 +558,7 @@ pub extern "C" fn zpr_grpc_accept(
     }
     ffi::guard(ZPR_ERR, move || {
         let q = unsafe { &*queue };
-        let mut pending = q.pending.lock().unwrap();
+        let mut pending = q.pending.lock_ok();
         let Some((id, path)) = pending.pop_front() else { return ZPR_CALL_NONE };
         let rc = ffi::copy_into(path.as_bytes(), out_method, out_method_cap, out_method_len);
         if rc != ffi::ZPR_OK {
@@ -593,7 +593,7 @@ pub extern "C" fn zpr_grpc_call_read_into(
     }
     ffi::guard(ZPR_ERR, move || {
         let q = unsafe { &*queue };
-        let mut live = q.live.lock().unwrap();
+        let mut live = q.live.lock_ok();
         let Some(call) = live.get_mut(&call_id) else {
             ffi::set_last_error(format!("no live call with id {call_id}"));
             return ZPR_ERR;
@@ -653,7 +653,7 @@ pub extern "C" fn zpr_grpc_call_write(
             unsafe { std::slice::from_raw_parts(data, len) }.to_vec()
         };
         let q = unsafe { &*queue };
-        let live = q.live.lock().unwrap();
+        let live = q.live.lock_ok();
         let Some(call) = live.get(&call_id) else {
             ffi::set_last_error(format!("no live call with id {call_id}"));
             return ZPR_ERR;
@@ -698,7 +698,7 @@ pub extern "C" fn zpr_grpc_call_complete(
             }
         };
         let q = unsafe { &*queue };
-        let Some(mut call) = q.live.lock().unwrap().remove(&call_id) else {
+        let Some(mut call) = q.live.lock_ok().remove(&call_id) else {
             ffi::set_last_error(format!("no live call with id {call_id}"));
             return ZPR_ERR;
         };
@@ -724,10 +724,10 @@ pub extern "C" fn zpr_grpc_queue_stats(
     ffi::guard(ZPR_ERR, move || {
         let q = unsafe { &*queue };
         if !out_pending.is_null() {
-            unsafe { *out_pending = q.pending.lock().unwrap().len() };
+            unsafe { *out_pending = q.pending.lock_ok().len() };
         }
         if !out_live.is_null() {
-            unsafe { *out_live = q.live.lock().unwrap().len() };
+            unsafe { *out_live = q.live.lock_ok().len() };
         }
         ZPR_OK
     })
@@ -741,7 +741,7 @@ pub extern "C" fn zpr_grpc_queue_free(queue: *mut CallQueue) {
         return;
     }
     let q = unsafe { Arc::from_raw(queue as *const CallQueue) };
-    let mut live = q.live.lock().unwrap();
+    let mut live = q.live.lock_ok();
     for (_, mut call) in live.drain() {
         if let Some(tx) = call.status_tx.take() {
             let _ = tx.send((GRPC_UNAVAILABLE, "the server stopped before this call was answered".into()));

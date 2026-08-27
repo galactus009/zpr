@@ -34,7 +34,7 @@ use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 use tonic::metadata::{Ascii, MetadataKey, MetadataValue};
 use tonic::transport::{Channel, Endpoint};
 
-use crate::ffi::{self, cstr_to_str, runtime, string_to_cstring_ptr, ZprBuffer, ZPR_ERR, ZPR_OK};
+use crate::ffi::{LockExt, self, cstr_to_str, runtime, string_to_cstring_ptr, ZprBuffer, ZPR_ERR, ZPR_OK};
 
 // ---------------------------------------------------------------------
 // A codec that passes protobuf bytes through untouched. tonic's generated
@@ -108,7 +108,7 @@ static PROXY_OVERRIDE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 #[no_mangle]
 pub extern "C" fn zpr_grpc_set_proxy(proxy_url: *const c_char) -> i32 {
     ffi::guard(ZPR_ERR, move || {
-        let mut slot = PROXY_OVERRIDE.get_or_init(Default::default).lock().unwrap();
+        let mut slot = PROXY_OVERRIDE.get_or_init(Default::default).lock_ok();
         if proxy_url.is_null() {
             *slot = None;
             return ZPR_OK;
@@ -138,7 +138,7 @@ fn host_matches_no_proxy(host: &str, no_proxy: &str) -> bool {
 }
 
 fn resolve_proxy(target: &http::Uri) -> Option<http::Uri> {
-    if let Some(explicit) = PROXY_OVERRIDE.get_or_init(Default::default).lock().unwrap().clone() {
+    if let Some(explicit) = PROXY_OVERRIDE.get_or_init(Default::default).lock_ok().clone() {
         return explicit.parse().ok();
     }
     let host = target.host().unwrap_or("");
@@ -261,7 +261,7 @@ async fn connect_channel(endpoint_str: &str) -> Result<Channel, String> {
 }
 
 async fn get_channel(endpoint: &str) -> Result<Channel, String> {
-    if let Some(ch) = CHANNELS.get_or_init(Default::default).lock().unwrap().get(endpoint) {
+    if let Some(ch) = CHANNELS.get_or_init(Default::default).lock_ok().get(endpoint) {
         return Ok(ch.clone());
     }
     let ch = connect_channel(endpoint).await?;
@@ -274,7 +274,7 @@ async fn get_channel(endpoint: &str) -> Result<Channel, String> {
 }
 
 async fn drop_channel(endpoint: &str) {
-    CHANNELS.get_or_init(Default::default).lock().unwrap().remove(endpoint);
+    CHANNELS.get_or_init(Default::default).lock_ok().remove(endpoint);
 }
 
 /// Inserts `metadata_json` (a JSON object of `{"header-name": "value"}`, or
@@ -866,7 +866,7 @@ pub extern "C" fn zpr_grpc_client_stream_read(stream: *mut GrpcClientStream, out
                 }
             },
             ClientStreamMode::Ring(ring) => {
-                let mut g = ring.inner.lock().unwrap();
+                let mut g = ring.inner.lock_ok();
                 match g.q.pop_front() {
                     Some(m) => m,
                     None => {
@@ -943,7 +943,7 @@ pub extern "C" fn zpr_grpc_client_stream_read_into(
                 }
             },
             ClientStreamMode::Ring(ring) => {
-                let mut g = ring.inner.lock().unwrap();
+                let mut g = ring.inner.lock_ok();
                 match g.q.pop_front() {
                     Some(m) => Some(m),
                     None => {
@@ -1037,7 +1037,7 @@ pub extern "C" fn zpr_grpc_client_stream_buffer(
             loop {
                 match inner.message().await {
                     Ok(Some(msg)) => {
-                        let mut g = ring.inner.lock().unwrap();
+                        let mut g = ring.inner.lock_ok();
                         if g.q.len() >= g.cap {
                             g.q.pop_front();
                             g.dropped += 1;
@@ -1045,11 +1045,11 @@ pub extern "C" fn zpr_grpc_client_stream_buffer(
                         g.q.push_back(msg);
                     }
                     Ok(None) => {
-                        ring.inner.lock().unwrap().done = true;
+                        ring.inner.lock_ok().done = true;
                         return;
                     }
                     Err(status) => {
-                        let mut g = ring.inner.lock().unwrap();
+                        let mut g = ring.inner.lock_ok();
                         g.err = Some(status.message().to_string());
                         g.done = true;
                         return;
@@ -1086,7 +1086,7 @@ pub extern "C" fn zpr_grpc_client_stream_stats(
         let s = unsafe { &*stream };
         let (depth, dropped) = match &s.mode {
             ClientStreamMode::Ring(r) => {
-                let g = r.inner.lock().unwrap();
+                let g = r.inner.lock_ok();
                 (g.q.len(), g.dropped)
             }
             ClientStreamMode::Pull(_) => (0, 0),

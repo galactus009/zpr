@@ -36,6 +36,28 @@ pub fn runtime() -> &'static tokio::runtime::Runtime {
 /// `set_last_error`.
 pub type ZprResult<T> = Result<T, String>;
 
+/// `Mutex::lock` without the poison panic.
+///
+/// ⚠ A POISONED MUTEX IS A PERMANENT OUTAGE, WHICH IS WORSE THAN A CRASH. Rust
+/// poisons a lock when a thread panics while holding it, and every later `lock()
+/// .unwrap()` panics too. At an FFI boundary those panics are caught — so the
+/// process does not die, it just answers ERROR to every call for the rest of its
+/// life, with no crash, no restart and nothing to alarm on. A daemon fails that
+/// way at 3am and looks healthy from the outside.
+///
+/// Poisoning says "a panic happened while this was held", not "this data is
+/// unusable". For a queue and a map the useful response is to take the data and
+/// carry on: the panic itself is already recorded as the last error by `guard`.
+pub trait LockExt<T> {
+    fn lock_ok(&self) -> std::sync::MutexGuard<'_, T>;
+}
+
+impl<T> LockExt<T> for std::sync::Mutex<T> {
+    fn lock_ok(&self) -> std::sync::MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 /// A Rust-owned byte buffer handed to the caller. Always free with `zpr_buffer_free`.
 #[repr(C)]
 pub struct ZprBuffer {
