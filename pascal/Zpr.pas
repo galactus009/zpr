@@ -80,6 +80,7 @@ type
   PGrpcServerHandle = Pointer;
   PGrpcStream = Pointer;
   PCallQueue = Pointer;
+  PGrpcBidiStream = Pointer;
   PGrpcClientStream = Pointer;
 
   // Mirrors the C ZprBuffer struct exactly: a Rust-owned byte buffer.
@@ -422,6 +423,14 @@ type
   Tzpr_grpc_client_stream_buffer = function(Stream: PGrpcClientStream; Capacity: NativeUInt): Int32; cdecl;
   Tzpr_grpc_client_stream_stats = function(Stream: PGrpcClientStream; out OutDepth: NativeUInt;
     out OutDropped: UInt64): Int32; cdecl;
+  Tzpr_grpc_bidi_open = function(Endpoint, MethodPath, MetadataJson: PAnsiChar; SendCapacity: NativeUInt;
+    TimeoutMs: UInt32; out OutHandle: PGrpcBidiStream; out OutGrpcStatus: Int32): Int32; cdecl;
+  Tzpr_grpc_bidi_send = function(Stream: PGrpcBidiStream; Data: PByte; Len: NativeUInt): Int32; cdecl;
+  Tzpr_grpc_bidi_close_send = function(Stream: PGrpcBidiStream): Int32; cdecl;
+  Tzpr_grpc_bidi_read_into = function(Stream: PGrpcBidiStream; Output: PByte; OutCap: NativeUInt;
+    out OutLen: NativeUInt): Int32; cdecl;
+  Tzpr_grpc_bidi_buffer = function(Stream: PGrpcBidiStream; Capacity: NativeUInt): Int32; cdecl;
+  Tzpr_grpc_bidi_cancel = procedure(Stream: PGrpcBidiStream); cdecl;
 
   Tzpr_protobuf_pool_new = function(DescriptorSet: PByte; Len: NativeUInt): PDescriptorPool; cdecl;
   Tzpr_protobuf_pool_free = procedure(Handle: PDescriptorPool); cdecl;
@@ -520,6 +529,14 @@ function zpr_grpc_client_stream_read_into(Stream: PGrpcClientStream; Output: PBy
 function zpr_grpc_client_stream_buffer(Stream: PGrpcClientStream; Capacity: NativeUInt): Int32; cdecl; external name 'zpr_grpc_client_stream_buffer';
 function zpr_grpc_client_stream_stats(Stream: PGrpcClientStream; out OutDepth: NativeUInt;
     out OutDropped: UInt64): Int32; cdecl; external name 'zpr_grpc_client_stream_stats';
+function zpr_grpc_bidi_open(Endpoint, MethodPath, MetadataJson: PAnsiChar; SendCapacity: NativeUInt;
+    TimeoutMs: UInt32; out OutHandle: PGrpcBidiStream; out OutGrpcStatus: Int32): Int32; cdecl; external name 'zpr_grpc_bidi_open';
+function zpr_grpc_bidi_send(Stream: PGrpcBidiStream; Data: PByte; Len: NativeUInt): Int32; cdecl; external name 'zpr_grpc_bidi_send';
+function zpr_grpc_bidi_close_send(Stream: PGrpcBidiStream): Int32; cdecl; external name 'zpr_grpc_bidi_close_send';
+function zpr_grpc_bidi_read_into(Stream: PGrpcBidiStream; Output: PByte; OutCap: NativeUInt;
+    out OutLen: NativeUInt): Int32; cdecl; external name 'zpr_grpc_bidi_read_into';
+function zpr_grpc_bidi_buffer(Stream: PGrpcBidiStream; Capacity: NativeUInt): Int32; cdecl; external name 'zpr_grpc_bidi_buffer';
+procedure zpr_grpc_bidi_cancel(Stream: PGrpcBidiStream); cdecl; external name 'zpr_grpc_bidi_cancel';
 function zpr_protobuf_pool_new(DescriptorSet: PByte; Len: NativeUInt): PDescriptorPool; cdecl; external name 'zpr_protobuf_pool_new';
 procedure zpr_protobuf_pool_free(Handle: PDescriptorPool); cdecl; external name 'zpr_protobuf_pool_free';
 function zpr_protobuf_json_to_binary(Pool: PDescriptorPool; MessageType, Json: PAnsiChar;
@@ -597,6 +614,14 @@ function zpr_grpc_client_stream_read_into(Stream: PGrpcClientStream; Output: PBy
 function zpr_grpc_client_stream_buffer(Stream: PGrpcClientStream; Capacity: NativeUInt): Int32; cdecl; external ZPR_LIB name 'zpr_grpc_client_stream_buffer';
 function zpr_grpc_client_stream_stats(Stream: PGrpcClientStream; out OutDepth: NativeUInt;
     out OutDropped: UInt64): Int32; cdecl; external ZPR_LIB name 'zpr_grpc_client_stream_stats';
+function zpr_grpc_bidi_open(Endpoint, MethodPath, MetadataJson: PAnsiChar; SendCapacity: NativeUInt;
+    TimeoutMs: UInt32; out OutHandle: PGrpcBidiStream; out OutGrpcStatus: Int32): Int32; cdecl; external ZPR_LIB name 'zpr_grpc_bidi_open';
+function zpr_grpc_bidi_send(Stream: PGrpcBidiStream; Data: PByte; Len: NativeUInt): Int32; cdecl; external ZPR_LIB name 'zpr_grpc_bidi_send';
+function zpr_grpc_bidi_close_send(Stream: PGrpcBidiStream): Int32; cdecl; external ZPR_LIB name 'zpr_grpc_bidi_close_send';
+function zpr_grpc_bidi_read_into(Stream: PGrpcBidiStream; Output: PByte; OutCap: NativeUInt;
+    out OutLen: NativeUInt): Int32; cdecl; external ZPR_LIB name 'zpr_grpc_bidi_read_into';
+function zpr_grpc_bidi_buffer(Stream: PGrpcBidiStream; Capacity: NativeUInt): Int32; cdecl; external ZPR_LIB name 'zpr_grpc_bidi_buffer';
+procedure zpr_grpc_bidi_cancel(Stream: PGrpcBidiStream); cdecl; external ZPR_LIB name 'zpr_grpc_bidi_cancel';
 function zpr_protobuf_pool_new(DescriptorSet: PByte; Len: NativeUInt): PDescriptorPool; cdecl; external ZPR_LIB name 'zpr_protobuf_pool_new';
 procedure zpr_protobuf_pool_free(Handle: PDescriptorPool); cdecl; external ZPR_LIB name 'zpr_protobuf_pool_free';
 function zpr_protobuf_json_to_binary(Pool: PDescriptorPool; MessageType, Json: PAnsiChar;
@@ -659,6 +684,12 @@ function zpr_json_object_set(Obj: PJsonValue; Key: PAnsiChar; Value: PJsonValue)
   zpr_grpc_client_stream_read_into: Tzpr_grpc_client_stream_read_into;
   zpr_grpc_client_stream_buffer: Tzpr_grpc_client_stream_buffer;
   zpr_grpc_client_stream_stats: Tzpr_grpc_client_stream_stats;
+  zpr_grpc_bidi_open: Tzpr_grpc_bidi_open;
+  zpr_grpc_bidi_send: Tzpr_grpc_bidi_send;
+  zpr_grpc_bidi_close_send: Tzpr_grpc_bidi_close_send;
+  zpr_grpc_bidi_read_into: Tzpr_grpc_bidi_read_into;
+  zpr_grpc_bidi_buffer: Tzpr_grpc_bidi_buffer;
+  zpr_grpc_bidi_cancel: Tzpr_grpc_bidi_cancel;
 
   zpr_protobuf_pool_new: Tzpr_protobuf_pool_new;
   zpr_protobuf_pool_free: Tzpr_protobuf_pool_free;
@@ -768,6 +799,12 @@ begin
     zpr_grpc_client_stream_read_into := Tzpr_grpc_client_stream_read_into(Resolve('zpr_grpc_client_stream_read_into'));
     zpr_grpc_client_stream_buffer := Tzpr_grpc_client_stream_buffer(Resolve('zpr_grpc_client_stream_buffer'));
     zpr_grpc_client_stream_stats := Tzpr_grpc_client_stream_stats(Resolve('zpr_grpc_client_stream_stats'));
+    zpr_grpc_bidi_open := Tzpr_grpc_bidi_open(Resolve('zpr_grpc_bidi_open'));
+    zpr_grpc_bidi_send := Tzpr_grpc_bidi_send(Resolve('zpr_grpc_bidi_send'));
+    zpr_grpc_bidi_close_send := Tzpr_grpc_bidi_close_send(Resolve('zpr_grpc_bidi_close_send'));
+    zpr_grpc_bidi_read_into := Tzpr_grpc_bidi_read_into(Resolve('zpr_grpc_bidi_read_into'));
+    zpr_grpc_bidi_buffer := Tzpr_grpc_bidi_buffer(Resolve('zpr_grpc_bidi_buffer'));
+    zpr_grpc_bidi_cancel := Tzpr_grpc_bidi_cancel(Resolve('zpr_grpc_bidi_cancel'));
 
     zpr_protobuf_pool_new := Tzpr_protobuf_pool_new(Resolve('zpr_protobuf_pool_new'));
     zpr_protobuf_pool_free := Tzpr_protobuf_pool_free(Resolve('zpr_protobuf_pool_free'));

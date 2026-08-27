@@ -282,7 +282,11 @@ async fn drop_channel(endpoint: &str) {
 /// built for stamp the same auth/edge headers on *every* call — unary and
 /// streaming alike — from one call site, so this is the single place that
 /// contract is honored rather than something each caller has to get right.
-fn apply_metadata_json(req: &mut tonic::Request<Vec<u8>>, metadata_json: Option<&str>) -> Result<(), String> {
+///
+/// Generic over the body because the bidirectional call carries a STREAM where
+/// the others carry bytes — the metadata rules are identical either way, and
+/// splitting them would be two places to keep one contract.
+fn apply_metadata_json<T>(req: &mut tonic::Request<T>, metadata_json: Option<&str>) -> Result<(), String> {
     let Some(json) = metadata_json else { return Ok(()) };
     let value: serde_json::Value = serde_json::from_str(json).map_err(|e| format!("invalid metadata JSON: {e}"))?;
     let obj = value.as_object().ok_or("metadata JSON must be an object")?;
@@ -437,6 +441,223 @@ pub extern "C" fn zpr_grpc_call(
 // (that one is the server *handler's* view of an in-flight call; this one
 // is the client's view of a call it opened).
 // ---------------------------------------------------------------------
+
+/// A request stream fed by the host, one `zpr_grpc_bidi_send` at a time.
+///
+/// tonic wants a `Stream` for the outbound half of a bidirectional call; the
+/// host has a function it calls whenever it feels like it. This is the adapter
+/// between the two: sends land in a channel, and closing the channel is what the
+/// server sees as "the client is done sending".
+struct ReqStream(tokio::sync::mpsc::Receiver<Vec<u8>>);
+
+impl futures_util::Stream for ReqStream {
+    type Item = Vec<u8>;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Vec<u8>>> {
+        self.0.poll_recv(cx)
+    }
+}
+
+/// Both halves of a bidirectional call.
+///
+/// ⚠ CLIENT-STREAMING IS THIS, NOT A SEPARATE API. A client-streaming RPC is a
+/// bidirectional one where the server happens to answer once: send what you
+/// have, call `zpr_grpc_bidi_close_send`, then read a single message. Giving it
+/// its own entry point would be a second code path to keep correct for no new
+/// capability.
+pub struct GrpcBidiStream {
+    tx: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+    /// The inbound half, reusing the ring/pending machinery the server-streaming
+    /// handle already has rather than growing a second copy of it.
+    reader: GrpcClientStream,
+}
+
+/// Opens a bidirectional call. Nothing is sent until `zpr_grpc_bidi_send`.
+///
+/// `timeout_ms` bounds only the opening, never the call's lifetime.
+#[no_mangle]
+pub extern "C" fn zpr_grpc_bidi_open(
+    endpoint: *const c_char,
+    method_path: *const c_char,
+    metadata_json: *const c_char,
+    send_capacity: usize,
+    timeout_ms: u32,
+    out_handle: *mut *mut GrpcBidiStream,
+    out_grpc_status: *mut i32,
+) -> i32 {
+    if !out_handle.is_null() {
+        unsafe { *out_handle = std::ptr::null_mut() };
+    }
+    if !out_grpc_status.is_null() {
+        unsafe { *out_grpc_status = -1 };
+    }
+    ffi::guard(GRPC_CALL_TRANSPORT_ERR, move || {
+        let endpoint = match unsafe { cstr_to_str(endpoint) } {
+            Ok(s) => s.to_string(),
+            Err(e) => { ffi::set_last_error(e); return GRPC_CALL_TRANSPORT_ERR; }
+        };
+        let path_str = match unsafe { cstr_to_str(method_path) } {
+            Ok(s) => s.to_string(),
+            Err(e) => { ffi::set_last_error(e); return GRPC_CALL_TRANSPORT_ERR; }
+        };
+        let path = match http::uri::PathAndQuery::from_maybe_shared(path_str.clone()) {
+            Ok(p) => p,
+            Err(e) => {
+                ffi::set_last_error(format!("bad method path {path_str:?}: {e}"));
+                return GRPC_CALL_TRANSPORT_ERR;
+            }
+        };
+        let metadata_json = if metadata_json.is_null() {
+            None
+        } else {
+            match unsafe { cstr_to_str(metadata_json) } {
+                Ok(s) => Some(s.to_string()),
+                Err(e) => { ffi::set_last_error(e); return GRPC_CALL_TRANSPORT_ERR; }
+            }
+        };
+
+        let cap = if send_capacity == 0 { 8 } else { send_capacity };
+        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(cap);
+
+        let outcome: Result<Result<tonic::Streaming<Vec<u8>>, tonic::Status>, String> =
+            runtime().block_on(async move {
+                let channel = get_channel(&endpoint).await?;
+                let mut client = tonic::client::Grpc::new(channel);
+                client.ready().await
+                    .map_err(|e| format!("gRPC transport not ready for {endpoint:?}: {e}"))?;
+                let mut req = tonic::Request::new(ReqStream(rx));
+                apply_metadata_json(&mut req, metadata_json.as_deref())?;
+                if timeout_ms > 0 {
+                    req.set_timeout(Duration::from_millis(timeout_ms as u64));
+                }
+                match client.streaming(req, path, BytesCodec).await {
+                    Ok(resp) => Ok(Ok(resp.into_inner())),
+                    Err(status) => Ok(Err(status)),
+                }
+            });
+
+        match outcome {
+            Ok(Ok(stream)) => {
+                if !out_grpc_status.is_null() {
+                    unsafe { *out_grpc_status = 0 };
+                }
+                let handle = Box::into_raw(Box::new(GrpcBidiStream {
+                    tx: Some(tx),
+                    reader: GrpcClientStream { mode: ClientStreamMode::Pull(stream), pending: None },
+                }));
+                if !out_handle.is_null() {
+                    unsafe { *out_handle = handle };
+                }
+                GRPC_CALL_OK
+            }
+            Ok(Err(status)) => {
+                if !out_grpc_status.is_null() {
+                    unsafe { *out_grpc_status = status.code() as i32 };
+                }
+                ffi::set_last_error(status.message().to_string());
+                GRPC_CALL_STATUS_ERR
+            }
+            Err(e) => { ffi::set_last_error(e); GRPC_CALL_TRANSPORT_ERR }
+        }
+    })
+}
+
+/// Sends one request message. Returns 1 when queued, 0 when the send window is
+/// full (retry — not a failure), or `ZPR_ERR` if the call is over or the sending
+/// half was already closed.
+#[no_mangle]
+pub extern "C" fn zpr_grpc_bidi_send(
+    stream: *mut GrpcBidiStream,
+    data: *const u8,
+    len: usize,
+) -> i32 {
+    if stream.is_null() {
+        ffi::set_last_error("null handle passed to zpr_grpc_bidi_send");
+        return ZPR_ERR;
+    }
+    ffi::guard(ZPR_ERR, move || {
+        let bytes = if len == 0 {
+            Vec::new()
+        } else if data.is_null() {
+            ffi::set_last_error("null data with a non-zero length");
+            return ZPR_ERR;
+        } else {
+            unsafe { std::slice::from_raw_parts(data, len) }.to_vec()
+        };
+        let s = unsafe { &mut *stream };
+        let Some(tx) = s.tx.as_ref() else {
+            ffi::set_last_error("the sending half is already closed");
+            return ZPR_ERR;
+        };
+        match tx.try_send(bytes) {
+            Ok(()) => 1,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => 0,
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                ffi::set_last_error("the server hung up before this message was sent");
+                ZPR_ERR
+            }
+        }
+    })
+}
+
+/// HALF-CLOSES: tells the server no more requests are coming, while leaving the
+/// response half open to read.
+///
+/// ⚠ A CLIENT-STREAMING CALL DOES NOT ANSWER UNTIL THIS IS CALLED. The server is
+/// waiting for the end of the request stream to compute its one reply, so a host
+/// that only ever sends will wait forever for a response it never asked to be
+/// produced.
+#[no_mangle]
+pub extern "C" fn zpr_grpc_bidi_close_send(stream: *mut GrpcBidiStream) -> i32 {
+    if stream.is_null() {
+        ffi::set_last_error("null handle passed to zpr_grpc_bidi_close_send");
+        return ZPR_ERR;
+    }
+    ffi::guard(ZPR_ERR, move || {
+        let s = unsafe { &mut *stream };
+        s.tx = None; // dropping the sender is what the server sees as end-of-stream
+        ZPR_OK
+    })
+}
+
+/// Reads the next response message into a caller-owned buffer. Same returns as
+/// `zpr_grpc_client_stream_read_into`.
+#[no_mangle]
+pub extern "C" fn zpr_grpc_bidi_read_into(
+    stream: *mut GrpcBidiStream,
+    out: *mut u8,
+    out_cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    if stream.is_null() {
+        ffi::set_last_error("null handle passed to zpr_grpc_bidi_read_into");
+        return ZPR_ERR;
+    }
+    let reader = unsafe { &mut (*stream).reader } as *mut GrpcClientStream;
+    zpr_grpc_client_stream_read_into(reader, out, out_cap, out_len)
+}
+
+/// Switches the RESPONSE half to a bounded ring, exactly as
+/// `zpr_grpc_client_stream_buffer` does — same lossy trade, same reasons.
+#[no_mangle]
+pub extern "C" fn zpr_grpc_bidi_buffer(stream: *mut GrpcBidiStream, capacity: usize) -> i32 {
+    if stream.is_null() {
+        ffi::set_last_error("null handle passed to zpr_grpc_bidi_buffer");
+        return ZPR_ERR;
+    }
+    let reader = unsafe { &mut (*stream).reader } as *mut GrpcClientStream;
+    zpr_grpc_client_stream_buffer(reader, capacity)
+}
+
+/// Ends the call and frees the handle. Do not use it afterward.
+#[no_mangle]
+pub extern "C" fn zpr_grpc_bidi_cancel(stream: *mut GrpcBidiStream) {
+    if !stream.is_null() {
+        unsafe { drop(Box::from_raw(stream)) };
+    }
+}
 
 /// Opaque handle to an open server-streaming call. Always end with
 /// `zpr_grpc_client_stream_cancel`.
