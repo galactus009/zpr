@@ -12,11 +12,14 @@
 //! link, not an Internet-facing endpoint. Put it behind a TLS-terminating
 //! proxy if that ever changes.
 
+use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::ffi::CString;
 use std::future::Future;
 use std::os::raw::{c_char, c_void};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use bytes::{Bytes, BytesMut};
@@ -81,9 +84,61 @@ unsafe impl Send for SendableStream {}
 
 #[derive(Clone)]
 struct PassthroughService {
-    handler: GrpcHandler,
-    user_data: SendableUserData,
+    dispatch: Dispatch,
 }
+
+/// How an inbound RPC reaches the host.
+#[derive(Clone)]
+enum Dispatch {
+    /// The original: a worker thread CALLS INTO the host.
+    ///
+    /// ⛔ NOT FOR A GUI HOST. `spawn_blocking` means handlers for different RPCs
+    /// run concurrently on threads this library owns, so the host is entered
+    /// from a foreign thread — and neither the LCL nor the VCL is thread-safe.
+    /// A handler that touches a form from here needs `Synchronize` and crashes
+    /// intermittently without it. Use `Queued` from any host with a UI.
+    Callback { handler: GrpcHandler, user_data: SendableUserData },
+    /// Inbound RPCs QUEUE, and the host collects them on its own thread.
+    ///
+    /// Nothing in this library ever calls the host: it polls `zpr_grpc_accept`,
+    /// answers by id, and is never entered from a thread it did not create. That
+    /// is the same rule the client streams follow, and it is what makes a
+    /// `TTimer` on the main thread a complete and correct server loop.
+    Queued(Arc<CallQueue>),
+}
+
+/// One RPC waiting to be collected, and the live ones already collected.
+pub struct CallQueue {
+    /// Arrived, not yet accepted.
+    pending: Mutex<VecDeque<(u64, String)>>,
+    /// Accepted and not yet completed, by id.
+    live: Mutex<HashMap<u64, LiveCall>>,
+    next_id: AtomicU64,
+}
+
+struct LiveCall {
+    inbound_rx: mpsc::Receiver<Vec<u8>>,
+    outbound_tx: mpsc::Sender<Vec<u8>>,
+    status_tx: Option<oneshot::Sender<(i32, String)>>,
+    /// A request message read off the wire that did not fit the host's buffer.
+    /// Same rule as the client: a short buffer is a resize, never a lost message.
+    pending_msg: Option<Vec<u8>>,
+    client_done: bool,
+}
+
+impl CallQueue {
+    fn new() -> Self {
+        Self {
+            pending: Mutex::new(VecDeque::new()),
+            live: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(1),
+        }
+    }
+}
+
+/// An RPC arrived but the host never accepted or completed it before the server
+/// stopped. Answered so a client is refused rather than left hanging.
+const GRPC_UNAVAILABLE: i32 = 14;
 
 /// Opaque per-RPC stream, bridging the async connection task and the
 /// synchronous handler thread. Free implicitly when the handler returns.
@@ -347,9 +402,350 @@ impl Service<http::Request<Incoming>> for PassthroughService {
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
     fn call(&self, req: http::Request<Incoming>) -> Self::Future {
-        let handler = self.handler;
-        let user_data = self.user_data;
-        Box::pin(handle(req, handler, user_data))
+        match &self.dispatch {
+            Dispatch::Callback { handler, user_data } => {
+                Box::pin(handle(req, *handler, *user_data))
+            }
+            Dispatch::Queued(q) => Box::pin(handle_queued(req, Arc::clone(q))),
+        }
+    }
+}
+
+/// The queued twin of `handle`: an RPC arrives, is given an id, and WAITS to be
+/// collected. Nothing calls the host.
+///
+/// The response head goes out immediately and the body streams from
+/// `outbound_rx`, exactly as in callback mode — so a host that takes its time
+/// accepting does not stall the response head, and a server-streaming reply can
+/// start flowing the moment the host writes its first message.
+async fn handle_queued(
+    req: http::Request<Incoming>,
+    queue: Arc<CallQueue>,
+) -> Result<http::Response<RespBody>, Infallible> {
+    let path = req.uri().path().to_string();
+
+    let (inbound_tx, inbound_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (outbound_tx, outbound_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (status_tx, status_rx) = oneshot::channel::<(i32, String)>();
+
+    tokio::spawn(pump_inbound(req.into_body(), inbound_tx));
+
+    let id = queue.next_id.fetch_add(1, Ordering::Relaxed);
+    queue.live.lock().unwrap().insert(
+        id,
+        LiveCall {
+            inbound_rx,
+            outbound_tx,
+            status_tx: Some(status_tx),
+            pending_msg: None,
+            client_done: false,
+        },
+    );
+    queue.pending.lock().unwrap().push_back((id, path));
+
+    let body = OutboundBody { rx: outbound_rx, status_rx, state: OutboundState::Streaming };
+    Ok(http::Response::builder()
+        .status(200)
+        .header("content-type", "application/grpc")
+        .body(BoxBody::new(body))
+        .expect("static response head is always valid"))
+}
+
+// ══ THE QUEUED SERVER, WHICH IS THE ONE A GUI SHOULD USE ═══════════════════════
+//
+// The whole surface is host-driven: accept, read, write, complete. Every call
+// returns at once — none of them blocks — so the natural implementation on the
+// host side is a timer that drains what is waiting and returns to the message
+// loop. No worker thread, no `Synchronize`, no reentrancy to reason about, and
+// no callback from a thread this library owns into a runtime that cannot take
+// one.
+
+/// Nothing is waiting right now. The ordinary answer, and not an error.
+pub const ZPR_CALL_NONE: i32 = 0;
+/// A message (or an RPC, for `accept`) was delivered.
+pub const ZPR_CALL_MESSAGE: i32 = 1;
+/// The client has finished sending. A unary request yields exactly one message
+/// and then this.
+pub const ZPR_CALL_CLIENT_DONE: i32 = 2;
+
+/// Starts a server that QUEUES inbound calls instead of calling a handler.
+///
+/// `out_queue` receives the queue every other function here takes; it lives as
+/// long as the server and is freed by `zpr_grpc_server_stop`.
+#[no_mangle]
+pub extern "C" fn zpr_grpc_server_start_queued(
+    bind_addr: *const c_char,
+    out_handle: *mut *mut GrpcServerHandle,
+    out_queue: *mut *mut CallQueue,
+) -> i32 {
+    if !out_handle.is_null() {
+        unsafe { *out_handle = std::ptr::null_mut() };
+    }
+    if !out_queue.is_null() {
+        unsafe { *out_queue = std::ptr::null_mut() };
+    }
+    ffi::guard(ZPR_ERR, move || {
+        let addr = match unsafe { cstr_to_str(bind_addr) } {
+            Ok(s) => s.to_string(),
+            Err(e) => {
+                ffi::set_last_error(e);
+                return ZPR_ERR;
+            }
+        };
+        let std_listener = match std::net::TcpListener::bind(&addr) {
+            Ok(l) => l,
+            Err(e) => {
+                ffi::set_last_error(format!("failed to bind {addr:?}: {e}"));
+                return ZPR_ERR;
+            }
+        };
+        if let Err(e) = std_listener.set_nonblocking(true) {
+            ffi::set_last_error(format!("failed to configure listener for {addr:?}: {e}"));
+            return ZPR_ERR;
+        }
+
+        let queue = Arc::new(CallQueue::new());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let service = PassthroughService { dispatch: Dispatch::Queued(Arc::clone(&queue)) };
+
+        let thread = std::thread::Builder::new().name("zpr-grpc-server".into()).spawn(move || {
+            let rt = match tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build() {
+                Ok(rt) => rt,
+                Err(_) => return,
+            };
+            rt.block_on(async move {
+                let Ok(listener) = TcpListener::from_std(std_listener) else { return };
+                accept_loop(listener, service, shutdown_rx).await;
+            });
+        });
+
+        match thread {
+            Ok(thread) => {
+                let handle = Box::into_raw(Box::new(GrpcServerHandle { shutdown: shutdown_tx, thread: Some(thread) }));
+                if !out_handle.is_null() {
+                    unsafe { *out_handle = handle };
+                }
+                if !out_queue.is_null() {
+                    unsafe { *out_queue = Arc::into_raw(queue) as *mut CallQueue };
+                }
+                ZPR_OK
+            }
+            Err(e) => {
+                ffi::set_last_error(format!("failed to start gRPC server thread: {e}"));
+                ZPR_ERR
+            }
+        }
+    })
+}
+
+/// Collects the next waiting RPC. Returns `ZPR_CALL_MESSAGE` and fills
+/// `*out_call_id` plus the method path, `ZPR_CALL_NONE` when nothing is waiting,
+/// or `ZPR_ERR_SHORT_BUFFER` if the path did not fit (the RPC stays queued, so
+/// retry with a bigger buffer).
+///
+/// Never blocks. Call it from a timer.
+#[no_mangle]
+pub extern "C" fn zpr_grpc_accept(
+    queue: *mut CallQueue,
+    out_call_id: *mut u64,
+    out_method: *mut u8,
+    out_method_cap: usize,
+    out_method_len: *mut usize,
+) -> i32 {
+    if queue.is_null() {
+        ffi::set_last_error("null queue passed to zpr_grpc_accept");
+        return ZPR_ERR;
+    }
+    ffi::guard(ZPR_ERR, move || {
+        let q = unsafe { &*queue };
+        let mut pending = q.pending.lock().unwrap();
+        let Some((id, path)) = pending.pop_front() else { return ZPR_CALL_NONE };
+        let rc = ffi::copy_into(path.as_bytes(), out_method, out_method_cap, out_method_len);
+        if rc != ffi::ZPR_OK {
+            // Put it back at the FRONT so ordering survives a resize.
+            pending.push_front((id, path));
+            return rc;
+        }
+        if !out_call_id.is_null() {
+            unsafe { *out_call_id = id };
+        }
+        ZPR_CALL_MESSAGE
+    })
+}
+
+/// Reads the next request message of an accepted call into a caller-owned
+/// buffer. `ZPR_CALL_MESSAGE`, `ZPR_CALL_NONE` (nothing yet — try again later),
+/// `ZPR_CALL_CLIENT_DONE`, `ZPR_ERR_SHORT_BUFFER` (message held), or `ZPR_ERR`.
+#[no_mangle]
+pub extern "C" fn zpr_grpc_call_read_into(
+    queue: *mut CallQueue,
+    call_id: u64,
+    out: *mut u8,
+    out_cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    if !out_len.is_null() {
+        unsafe { *out_len = 0 };
+    }
+    if queue.is_null() {
+        ffi::set_last_error("null queue passed to zpr_grpc_call_read_into");
+        return ZPR_ERR;
+    }
+    ffi::guard(ZPR_ERR, move || {
+        let q = unsafe { &*queue };
+        let mut live = q.live.lock().unwrap();
+        let Some(call) = live.get_mut(&call_id) else {
+            ffi::set_last_error(format!("no live call with id {call_id}"));
+            return ZPR_ERR;
+        };
+
+        if let Some(bytes) = call.pending_msg.take() {
+            let rc = ffi::copy_into(&bytes, out, out_cap, out_len);
+            if rc != ffi::ZPR_OK {
+                call.pending_msg = Some(bytes);
+                return rc;
+            }
+            return ZPR_CALL_MESSAGE;
+        }
+        if call.client_done {
+            return ZPR_CALL_CLIENT_DONE;
+        }
+        match call.inbound_rx.try_recv() {
+            Ok(bytes) => {
+                let rc = ffi::copy_into(&bytes, out, out_cap, out_len);
+                if rc != ffi::ZPR_OK {
+                    call.pending_msg = Some(bytes);
+                    return rc;
+                }
+                ZPR_CALL_MESSAGE
+            }
+            Err(mpsc::error::TryRecvError::Empty) => ZPR_CALL_NONE,
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                call.client_done = true;
+                ZPR_CALL_CLIENT_DONE
+            }
+        }
+    })
+}
+
+/// Writes one response message. A unary reply is exactly one of these; a
+/// server-streaming reply is many. Never blocks: if the client is not reading
+/// and the window is full this answers `ZPR_CALL_NONE`, and the host should
+/// retry rather than treat it as failure.
+#[no_mangle]
+pub extern "C" fn zpr_grpc_call_write(
+    queue: *mut CallQueue,
+    call_id: u64,
+    data: *const u8,
+    len: usize,
+) -> i32 {
+    if queue.is_null() {
+        ffi::set_last_error("null queue passed to zpr_grpc_call_write");
+        return ZPR_ERR;
+    }
+    ffi::guard(ZPR_ERR, move || {
+        let bytes = if len == 0 {
+            Vec::new()
+        } else if data.is_null() {
+            ffi::set_last_error("null data with a non-zero length");
+            return ZPR_ERR;
+        } else {
+            unsafe { std::slice::from_raw_parts(data, len) }.to_vec()
+        };
+        let q = unsafe { &*queue };
+        let live = q.live.lock().unwrap();
+        let Some(call) = live.get(&call_id) else {
+            ffi::set_last_error(format!("no live call with id {call_id}"));
+            return ZPR_ERR;
+        };
+        match call.outbound_tx.try_send(bytes) {
+            Ok(()) => ZPR_CALL_MESSAGE,
+            Err(mpsc::error::TrySendError::Full(_)) => ZPR_CALL_NONE,
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                ffi::set_last_error("the client hung up before this message was sent");
+                ZPR_ERR
+            }
+        }
+    })
+}
+
+/// Ends a call with a `google.rpc.Code` and an optional message, and forgets it.
+///
+/// ⚠ EVERY ACCEPTED CALL MUST REACH THIS, INCLUDING THE FAILING ONES. An id that
+/// is never completed holds its channels open and leaves the client waiting for
+/// trailers that never come — the request looks hung rather than refused.
+#[no_mangle]
+pub extern "C" fn zpr_grpc_call_complete(
+    queue: *mut CallQueue,
+    call_id: u64,
+    grpc_status: i32,
+    message: *const c_char,
+) -> i32 {
+    if queue.is_null() {
+        ffi::set_last_error("null queue passed to zpr_grpc_call_complete");
+        return ZPR_ERR;
+    }
+    ffi::guard(ZPR_ERR, move || {
+        let msg = if message.is_null() {
+            String::new()
+        } else {
+            match unsafe { cstr_to_str(message) } {
+                Ok(s) => s.to_string(),
+                Err(e) => {
+                    ffi::set_last_error(e);
+                    return ZPR_ERR;
+                }
+            }
+        };
+        let q = unsafe { &*queue };
+        let Some(mut call) = q.live.lock().unwrap().remove(&call_id) else {
+            ffi::set_last_error(format!("no live call with id {call_id}"));
+            return ZPR_ERR;
+        };
+        if let Some(tx) = call.status_tx.take() {
+            let _ = tx.send((grpc_status, msg));
+        }
+        ZPR_OK
+    })
+}
+
+/// How many RPCs are waiting to be accepted, and how many are accepted but not
+/// yet completed. A `live` count that only grows is a host leaking call ids.
+#[no_mangle]
+pub extern "C" fn zpr_grpc_queue_stats(
+    queue: *mut CallQueue,
+    out_pending: *mut usize,
+    out_live: *mut usize,
+) -> i32 {
+    if queue.is_null() {
+        ffi::set_last_error("null queue passed to zpr_grpc_queue_stats");
+        return ZPR_ERR;
+    }
+    ffi::guard(ZPR_ERR, move || {
+        let q = unsafe { &*queue };
+        if !out_pending.is_null() {
+            unsafe { *out_pending = q.pending.lock().unwrap().len() };
+        }
+        if !out_live.is_null() {
+            unsafe { *out_live = q.live.lock().unwrap().len() };
+        }
+        ZPR_OK
+    })
+}
+
+/// Releases the queue handle. Call AFTER `zpr_grpc_server_stop`; any call still
+/// live is answered UNAVAILABLE so no client is left waiting on trailers.
+#[no_mangle]
+pub extern "C" fn zpr_grpc_queue_free(queue: *mut CallQueue) {
+    if queue.is_null() {
+        return;
+    }
+    let q = unsafe { Arc::from_raw(queue as *const CallQueue) };
+    let mut live = q.live.lock().unwrap();
+    for (_, mut call) in live.drain() {
+        if let Some(tx) = call.status_tx.take() {
+            let _ = tx.send((GRPC_UNAVAILABLE, "the server stopped before this call was answered".into()));
+        }
     }
 }
 
@@ -406,7 +802,9 @@ pub extern "C" fn zpr_grpc_server_start(
         }
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let service = PassthroughService { handler, user_data: SendableUserData(user_data) };
+        let service = PassthroughService {
+            dispatch: Dispatch::Callback { handler, user_data: SendableUserData(user_data) },
+        };
 
         let thread = std::thread::Builder::new().name("zero-grpc-server".into()).spawn(move || {
             let rt = match tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build() {
