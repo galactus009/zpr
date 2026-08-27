@@ -10,6 +10,12 @@ use std::sync::OnceLock;
 pub const ZPR_OK: i32 = 0;
 pub const ZPR_ERR: i32 = -1;
 
+/// The caller's buffer was too small. `*out_len` has been set to the size the
+/// message actually needs, and — this is the part that matters — **nothing was
+/// consumed**: retry the same call with a buffer that big and you get the same
+/// message. A short buffer is a resize, never a lost message.
+pub const ZPR_ERR_SHORT_BUFFER: i32 = -2;
+
 /// The shared multi-threaded runtime every blocking `zpr_*` call drives its
 /// async work through via `block_on`. Built lazily on first use, shared by
 /// the gRPC and HTTP capabilities so the process only ever pays for one.
@@ -74,6 +80,44 @@ pub extern "C" fn zpr_alloc(len: usize) -> *mut u8 {
     let ptr = v.as_mut_ptr();
     std::mem::forget(v);
     ptr
+}
+
+/// Copies `bytes` into a **caller-owned** buffer.
+///
+/// ⚠ THIS IS THE ALLOCATION-FREE PATH AND IT EXISTS FOR A REASON. Everything
+/// returning a `ZprBuffer` allocates with Rust's allocator and obliges the
+/// caller to call `zpr_buffer_free` — one bookkeeping step per message, in a
+/// host language with no RAII to attach it to. On a per-message path (a tick
+/// stream, a chain snapshot) that is a leak waiting for the one early `Exit`
+/// that skips the free, and a heap allocation per message besides.
+///
+/// Here the caller owns the memory — a `array[0..N] of Byte` on the Pascal
+/// stack is enough — and this library allocates nothing that crosses back.
+///
+/// `*out_len` is ALWAYS set to the true length, whether or not the copy
+/// happened, so a short buffer tells the caller exactly how big to make the
+/// next one.
+pub fn copy_into(bytes: &[u8], out: *mut u8, out_cap: usize, out_len: *mut usize) -> i32 {
+    if !out_len.is_null() {
+        unsafe { *out_len = bytes.len() };
+    }
+    if bytes.len() > out_cap {
+        set_last_error(format!(
+            "buffer too small: need {} bytes, got {}",
+            bytes.len(),
+            out_cap
+        ));
+        return ZPR_ERR_SHORT_BUFFER;
+    }
+    if out.is_null() {
+        if bytes.is_empty() {
+            return ZPR_OK;
+        }
+        set_last_error("null output buffer passed with a non-zero capacity");
+        return ZPR_ERR;
+    }
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, bytes.len()) };
+    ZPR_OK
 }
 
 /// Frees a string previously returned by this library (e.g. `zpr_protobuf_binary_to_json`).

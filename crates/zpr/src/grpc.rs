@@ -16,11 +16,11 @@
 //! builds/reads requests as JSON via `zpr_protobuf_json_to_binary` /
 //! `zpr_protobuf_binary_to_json` below.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::os::raw::c_char;
 use std::pin::Pin;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -440,7 +440,56 @@ pub extern "C" fn zpr_grpc_call(
 
 /// Opaque handle to an open server-streaming call. Always end with
 /// `zpr_grpc_client_stream_cancel`.
-pub struct GrpcClientStream(tonic::Streaming<Vec<u8>>);
+pub struct GrpcClientStream {
+    mode: ClientStreamMode,
+    /// A message that was read off the wire but did not fit the caller's buffer.
+    /// Held here so a short buffer is a RESIZE, never a lost message.
+    pending: Option<Vec<u8>>,
+}
+
+enum ClientStreamMode {
+    /// Pulled straight off the wire, one blocking read at a time.
+    ///
+    /// LOSSLESS, and backpressured for free: a host that stops reading stops
+    /// draining the HTTP/2 window, and the server is slowed by flow control
+    /// rather than by anything this library does. The cost is that the read
+    /// BLOCKS — fine on a worker thread, fatal on a GUI thread.
+    Pull(tonic::Streaming<Vec<u8>>),
+    /// A pump task fills a bounded ring; the host polls it without blocking.
+    ///
+    /// ⚠ LOSSY BY DESIGN, AND THAT IS THE WHOLE TRADE. When the ring is full
+    /// the OLDEST message is discarded, because the streams this mode is for
+    /// are marks and depth, where a stale tick is worthless and the newest is
+    /// the only one worth having. It also breaks the backpressure above: the
+    /// pump keeps draining the window whether or not the host keeps up, so the
+    /// server never learns the host is slow.
+    ///
+    /// ⛔ DO NOT USE IT FOR A LOSSLESS STREAM. Order updates, fills and
+    /// position changes are not interchangeable with their successors — a
+    /// dropped fill is a position the host never learns about. Those want
+    /// `Pull` on a worker thread.
+    Ring(Arc<Ring>),
+}
+
+/// The bounded queue behind `ClientStreamMode::Ring`.
+struct Ring {
+    inner: Mutex<RingInner>,
+}
+
+struct RingInner {
+    q: VecDeque<Vec<u8>>,
+    cap: usize,
+    /// How many messages the pump discarded to make room. ⚠ THE POINT OF THIS
+    /// COUNTER IS THAT LOSS IS OTHERWISE INVISIBLE: a host that falls behind
+    /// sees a perfectly healthy stream of newest-first messages and no
+    /// indication that anything went missing. Poll it; alarm on it.
+    dropped: u64,
+    /// The server finished cleanly.
+    done: bool,
+    /// The stream failed. Held rather than reported once, so a poller that
+    /// arrives after the failure still learns about it.
+    err: Option<String>,
+}
 
 /// Opens a server-streaming gRPC call, sending `request` as the single
 /// initiating message. `metadata_json` follows the same convention as
@@ -536,7 +585,10 @@ pub extern "C" fn zpr_grpc_client_stream_open(
                 if !out_grpc_status.is_null() {
                     unsafe { *out_grpc_status = 0 };
                 }
-                let handle = Box::into_raw(Box::new(GrpcClientStream(stream)));
+                let handle = Box::into_raw(Box::new(GrpcClientStream {
+                    mode: ClientStreamMode::Pull(stream),
+                    pending: None,
+                }));
                 if !out_handle.is_null() {
                     unsafe { *out_handle = handle };
                 }
@@ -573,19 +625,45 @@ pub extern "C" fn zpr_grpc_client_stream_read(stream: *mut GrpcClientStream, out
     }
     ffi::guard(ZPR_ERR, move || {
         let s = unsafe { &mut *stream };
-        match runtime().block_on(s.0.message()) {
-            Ok(Some(msg)) => {
-                if !out.is_null() {
-                    unsafe { *out = ZprBuffer::from_vec(msg) };
-                }
-                1
+
+        // A message held back by an earlier short buffer on `..._read_into`
+        // outranks the wire: the two entry points share one queue position.
+        if let Some(bytes) = s.pending.take() {
+            if !out.is_null() {
+                unsafe { *out = ZprBuffer::from_vec(bytes) };
             }
-            Ok(None) => 0,
-            Err(status) => {
-                ffi::set_last_error(status.message().to_string());
-                ZPR_ERR
-            }
+            return 1;
         }
+
+        let msg: Vec<u8> = match &mut s.mode {
+            ClientStreamMode::Pull(inner) => match runtime().block_on(inner.message()) {
+                Ok(Some(m)) => m,
+                Ok(None) => return 0,
+                Err(status) => {
+                    ffi::set_last_error(status.message().to_string());
+                    return ZPR_ERR;
+                }
+            },
+            ClientStreamMode::Ring(ring) => {
+                let mut g = ring.inner.lock().unwrap();
+                match g.q.pop_front() {
+                    Some(m) => m,
+                    None => {
+                        if let Some(e) = g.err.clone() {
+                            ffi::set_last_error(e);
+                            return ZPR_ERR;
+                        }
+                        // Buffered mode never blocks, here either.
+                        return 0;
+                    }
+                }
+            }
+        };
+
+        if !out.is_null() {
+            unsafe { *out = ZprBuffer::from_vec(msg) };
+        }
+        1
     })
 }
 
@@ -597,6 +675,209 @@ pub extern "C" fn zpr_grpc_client_stream_cancel(stream: *mut GrpcClientStream) {
     if !stream.is_null() {
         unsafe { drop(Box::from_raw(stream)) };
     }
+}
+
+/// Reads the next message into a **caller-owned** buffer. Same blocking
+/// semantics as `zpr_grpc_client_stream_read`, without the allocation or the
+/// obligation to free.
+///
+/// Returns 1 and sets `*out_len` when a message was written, 0 when the server
+/// finished cleanly, `ZPR_ERR_SHORT_BUFFER` when the buffer was too small (and
+/// then `*out_len` is the size needed — the message is HELD, so calling again
+/// with a bigger buffer returns that same message), or `ZPR_ERR`.
+#[no_mangle]
+pub extern "C" fn zpr_grpc_client_stream_read_into(
+    stream: *mut GrpcClientStream,
+    out: *mut u8,
+    out_cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    if !out_len.is_null() {
+        unsafe { *out_len = 0 };
+    }
+    if stream.is_null() {
+        ffi::set_last_error("null stream handle passed to zpr_grpc_client_stream_read_into");
+        return ZPR_ERR;
+    }
+    ffi::guard(ZPR_ERR, move || {
+        let s = unsafe { &mut *stream };
+
+        // A message held back by an earlier short buffer outranks the wire.
+        if let Some(bytes) = s.pending.take() {
+            let rc = ffi::copy_into(&bytes, out, out_cap, out_len);
+            if rc != ffi::ZPR_OK {
+                s.pending = Some(bytes);
+                return rc;
+            }
+            return 1;
+        }
+
+        let next = match &mut s.mode {
+            ClientStreamMode::Pull(inner) => match runtime().block_on(inner.message()) {
+                Ok(Some(msg)) => Some(msg),
+                Ok(None) => return 0,
+                Err(status) => {
+                    ffi::set_last_error(status.message().to_string());
+                    return ZPR_ERR;
+                }
+            },
+            ClientStreamMode::Ring(ring) => {
+                let mut g = ring.inner.lock().unwrap();
+                match g.q.pop_front() {
+                    Some(m) => Some(m),
+                    None => {
+                        if let Some(e) = g.err.clone() {
+                            ffi::set_last_error(e);
+                            return ZPR_ERR;
+                        }
+                        if g.done {
+                            return 0;
+                        }
+                        // Buffered mode never blocks. Empty is the ordinary answer.
+                        return 0;
+                    }
+                }
+            }
+        };
+
+        let bytes = match next {
+            Some(b) => b,
+            None => return 0,
+        };
+        let rc = ffi::copy_into(&bytes, out, out_cap, out_len);
+        if rc != ffi::ZPR_OK {
+            s.pending = Some(bytes);
+            return rc;
+        }
+        1
+    })
+}
+
+/// Switches an open stream to BUFFERED mode: a pump task drains the wire into a
+/// ring of `capacity` messages and `..._read_into` stops blocking.
+///
+/// ⚠ THIS IS THE MODE A GUI WANTS, AND IT IS LOSSY. Poll it from a timer on the
+/// main thread — no worker thread, no `Synchronize`, no callback from a foreign
+/// thread into a runtime that is not thread-safe. The price is that a full ring
+/// discards its OLDEST message: right for marks and depth, WRONG for order
+/// events, where the successor does not carry what the dropped one said.
+///
+/// Read `zpr_grpc_client_stream_stats` to see whether anything was discarded;
+/// without it the loss is invisible.
+///
+/// Idempotent-ish: calling it on an already-buffered stream is an error rather
+/// than a second pump.
+#[no_mangle]
+pub extern "C" fn zpr_grpc_client_stream_buffer(
+    stream: *mut GrpcClientStream,
+    capacity: usize,
+) -> i32 {
+    if stream.is_null() {
+        ffi::set_last_error("null stream handle passed to zpr_grpc_client_stream_buffer");
+        return ZPR_ERR;
+    }
+    if capacity == 0 {
+        ffi::set_last_error("a ring capacity of 0 would discard every message as it arrived");
+        return ZPR_ERR;
+    }
+    ffi::guard(ZPR_ERR, move || {
+        let s = unsafe { &mut *stream };
+        let inner = match std::mem::replace(
+            &mut s.mode,
+            ClientStreamMode::Ring(Arc::new(Ring {
+                inner: Mutex::new(RingInner {
+                    q: VecDeque::new(),
+                    cap: capacity,
+                    dropped: 0,
+                    done: false,
+                    err: None,
+                }),
+            })),
+        ) {
+            ClientStreamMode::Pull(inner) => inner,
+            already @ ClientStreamMode::Ring(_) => {
+                s.mode = already;
+                ffi::set_last_error("this stream is already buffered");
+                return ZPR_ERR;
+            }
+        };
+
+        let ring = match &s.mode {
+            ClientStreamMode::Ring(r) => Arc::clone(r),
+            _ => unreachable!("just installed"),
+        };
+
+        // The pump owns the wire from here. It ends when the server ends, when
+        // the stream errors, or when the handle is dropped and the Arc is the
+        // pump's alone — checked each iteration so a cancelled stream does not
+        // leave a task draining a socket forever.
+        let mut inner = inner;
+        runtime().spawn(async move {
+            loop {
+                match inner.message().await {
+                    Ok(Some(msg)) => {
+                        let mut g = ring.inner.lock().unwrap();
+                        if g.q.len() >= g.cap {
+                            g.q.pop_front();
+                            g.dropped += 1;
+                        }
+                        g.q.push_back(msg);
+                    }
+                    Ok(None) => {
+                        ring.inner.lock().unwrap().done = true;
+                        return;
+                    }
+                    Err(status) => {
+                        let mut g = ring.inner.lock().unwrap();
+                        g.err = Some(status.message().to_string());
+                        g.done = true;
+                        return;
+                    }
+                }
+                if Arc::strong_count(&ring) == 1 {
+                    return; // the caller cancelled; nobody is left to read.
+                }
+            }
+        });
+        ZPR_OK
+    })
+}
+
+/// How the ring is doing: how many messages are waiting, and how many were
+/// DISCARDED because the host did not keep up.
+///
+/// ⚠ `dropped` IS THE NUMBER THAT MATTERS AND IT ONLY GROWS. A host that never
+/// looks at it cannot tell a healthy feed from one it is silently losing — the
+/// messages it does receive look perfectly normal either way.
+///
+/// Answers zeroes for an unbuffered stream, which cannot drop anything.
+#[no_mangle]
+pub extern "C" fn zpr_grpc_client_stream_stats(
+    stream: *mut GrpcClientStream,
+    out_depth: *mut usize,
+    out_dropped: *mut u64,
+) -> i32 {
+    if stream.is_null() {
+        ffi::set_last_error("null stream handle passed to zpr_grpc_client_stream_stats");
+        return ZPR_ERR;
+    }
+    ffi::guard(ZPR_ERR, move || {
+        let s = unsafe { &*stream };
+        let (depth, dropped) = match &s.mode {
+            ClientStreamMode::Ring(r) => {
+                let g = r.inner.lock().unwrap();
+                (g.q.len(), g.dropped)
+            }
+            ClientStreamMode::Pull(_) => (0, 0),
+        };
+        if !out_depth.is_null() {
+            unsafe { *out_depth = depth };
+        }
+        if !out_dropped.is_null() {
+            unsafe { *out_dropped = dropped };
+        }
+        ZPR_OK
+    })
 }
 
 // ---------------------------------------------------------------------
