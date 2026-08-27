@@ -416,6 +416,11 @@ type
     out OutGrpcStatus: Int32): Int32; cdecl;
   Tzpr_grpc_client_stream_read = function(Stream: PGrpcClientStream; out Output: TZprBuffer): Int32; cdecl;
   Tzpr_grpc_client_stream_cancel = procedure(Stream: PGrpcClientStream); cdecl;
+  Tzpr_grpc_client_stream_read_into = function(Stream: PGrpcClientStream; Output: PByte;
+    OutCap: NativeUInt; out OutLen: NativeUInt): Int32; cdecl;
+  Tzpr_grpc_client_stream_buffer = function(Stream: PGrpcClientStream; Capacity: NativeUInt): Int32; cdecl;
+  Tzpr_grpc_client_stream_stats = function(Stream: PGrpcClientStream; out OutDepth: NativeUInt;
+    out OutDropped: UInt64): Int32; cdecl;
 
   Tzpr_protobuf_pool_new = function(DescriptorSet: PByte; Len: NativeUInt): PDescriptorPool; cdecl;
   Tzpr_protobuf_pool_free = procedure(Handle: PDescriptorPool); cdecl;
@@ -459,6 +464,81 @@ type
 var
   GLib: TZprLibHandle = InvalidLibHandle;
 
+{$IFDEF ZPR_STATIC}
+// ── STATICALLY LINKED ─────────────────────────────────────────────────────────
+//
+// ⚠ iOS IS WHY THIS MODE EXISTS. The dynamic path below is the portable one and
+// stays the default — one unit, no linker configuration, three desktop
+// platforms. It cannot work on iOS: an app may only load code inside its own
+// bundle, a bare .so is not that, and the store refuses builds that try. Android
+// is friendlier but still wants the .so packaged per-ABI into the APK.
+//
+// So on those two the library is linked, not loaded, and the symbols below are
+// resolved by the LINKER instead of by `Load`. Everything above and below this
+// block is unchanged, and every call site reads identically — which is the point
+// of doing it here rather than in the call sites.
+//
+// Build the archive with the target's own toolchain, e.g.
+//   cargo build --release --target aarch64-apple-ios          → libzpr.a
+//   cargo build --release --target aarch64-linux-android      → libzpr.a
+// then pass it to the Pascal linker. `crate-type` already emits `staticlib`.
+//
+// ⚠ A STATIC BUILD DRAGS IN THE WHOLE RUNTIME. tokio, rustls and hyper are all
+// in that archive; expect a much larger binary than the dylib, and strip it.
+function zpr_version: PAnsiChar; cdecl; external name 'zpr_version';
+procedure zpr_buffer_free(Buf: TZprBuffer); cdecl; external name 'zpr_buffer_free';
+function zpr_alloc(Len: NativeUInt): PByte; cdecl; external name 'zpr_alloc';
+procedure zpr_string_free(S: PAnsiChar); cdecl; external name 'zpr_string_free';
+function zpr_last_error: PAnsiChar; cdecl; external name 'zpr_last_error';
+function zpr_grpc_set_proxy(ProxyUrl: PAnsiChar): Int32; cdecl; external name 'zpr_grpc_set_proxy';
+function zpr_grpc_call(Endpoint, MethodPath, MetadataJson: PAnsiChar; Request: PByte;
+    RequestLen: NativeUInt; TimeoutMs: UInt32; out OutResponse: TZprBuffer;
+    out OutGrpcStatus: Int32): Int32; cdecl; external name 'zpr_grpc_call';
+function zpr_grpc_client_stream_open(Endpoint, MethodPath, MetadataJson: PAnsiChar; Request: PByte;
+    RequestLen: NativeUInt; TimeoutMs: UInt32; out OutHandle: PGrpcClientStream;
+    out OutGrpcStatus: Int32): Int32; cdecl; external name 'zpr_grpc_client_stream_open';
+function zpr_grpc_client_stream_read(Stream: PGrpcClientStream; out Output: TZprBuffer): Int32; cdecl; external name 'zpr_grpc_client_stream_read';
+procedure zpr_grpc_client_stream_cancel(Stream: PGrpcClientStream); cdecl; external name 'zpr_grpc_client_stream_cancel';
+function zpr_grpc_client_stream_read_into(Stream: PGrpcClientStream; Output: PByte;
+    OutCap: NativeUInt; out OutLen: NativeUInt): Int32; cdecl; external name 'zpr_grpc_client_stream_read_into';
+function zpr_grpc_client_stream_buffer(Stream: PGrpcClientStream; Capacity: NativeUInt): Int32; cdecl; external name 'zpr_grpc_client_stream_buffer';
+function zpr_grpc_client_stream_stats(Stream: PGrpcClientStream; out OutDepth: NativeUInt;
+    out OutDropped: UInt64): Int32; cdecl; external name 'zpr_grpc_client_stream_stats';
+function zpr_protobuf_pool_new(DescriptorSet: PByte; Len: NativeUInt): PDescriptorPool; cdecl; external name 'zpr_protobuf_pool_new';
+procedure zpr_protobuf_pool_free(Handle: PDescriptorPool); cdecl; external name 'zpr_protobuf_pool_free';
+function zpr_protobuf_json_to_binary(Pool: PDescriptorPool; MessageType, Json: PAnsiChar;
+    out Output: TZprBuffer): Int32; cdecl; external name 'zpr_protobuf_json_to_binary';
+function zpr_protobuf_binary_to_json(Pool: PDescriptorPool; MessageType: PAnsiChar;
+    Data: PByte; DataLen: NativeUInt): PAnsiChar; cdecl; external name 'zpr_protobuf_binary_to_json';
+function zpr_grpc_stream_read(Stream: PGrpcStream; out Output: TZprBuffer): Int32; cdecl; external name 'zpr_grpc_stream_read';
+function zpr_grpc_stream_write(Stream: PGrpcStream; Data: PByte; Len: NativeUInt): Int32; cdecl; external name 'zpr_grpc_stream_write';
+function zpr_grpc_server_start(BindAddr: PAnsiChar; Handler: TZprGrpcHandlerProc;
+    UserData: Pointer; out OutHandle: PGrpcServerHandle): Int32; cdecl; external name 'zpr_grpc_server_start';
+function zpr_grpc_server_stop(Handle: PGrpcServerHandle): Int32; cdecl; external name 'zpr_grpc_server_stop';
+function zpr_http_set_proxy(ProxyUrl: PAnsiChar): Int32; cdecl; external name 'zpr_http_set_proxy';
+function zpr_http_request(Method, Url, HeadersJson: PAnsiChar; Body: PByte;
+    BodyLen: NativeUInt; TimeoutMs: UInt32; out OutStatus: UInt16;
+    out OutHeadersJson: PAnsiChar; out OutBody: TZprBuffer): Int32; cdecl; external name 'zpr_http_request';
+function zpr_json_parse(Text: PAnsiChar): PJsonValue; cdecl; external name 'zpr_json_parse';
+procedure zpr_json_free(Handle: PJsonValue); cdecl; external name 'zpr_json_free';
+function zpr_json_stringify(Handle: PJsonValue; Pretty: Int32): PAnsiChar; cdecl; external name 'zpr_json_stringify';
+function zpr_json_kind(Handle: PJsonValue): Int32; cdecl; external name 'zpr_json_kind';
+function zpr_json_as_bool(Handle: PJsonValue; out Value: Byte): Int32; cdecl; external name 'zpr_json_as_bool';
+function zpr_json_as_f64(Handle: PJsonValue; out Value: Double): Int32; cdecl; external name 'zpr_json_as_f64';
+function zpr_json_as_string(Handle: PJsonValue): PAnsiChar; cdecl; external name 'zpr_json_as_string';
+function zpr_json_array_len(Handle: PJsonValue): NativeInt; cdecl; external name 'zpr_json_array_len';
+function zpr_json_array_get(Handle: PJsonValue; Index: NativeUInt): PJsonValue; cdecl; external name 'zpr_json_array_get';
+function zpr_json_object_get(Handle: PJsonValue; Key: PAnsiChar): PJsonValue; cdecl; external name 'zpr_json_object_get';
+function zpr_json_object_keys(Handle: PJsonValue): PAnsiChar; cdecl; external name 'zpr_json_object_keys';
+function zpr_json_new_null: PJsonValue; cdecl; external name 'zpr_json_new_null';
+function zpr_json_new_bool(B: Byte): PJsonValue; cdecl; external name 'zpr_json_new_bool';
+function zpr_json_new_f64(N: Double): PJsonValue; cdecl; external name 'zpr_json_new_f64';
+function zpr_json_new_string(S: PAnsiChar): PJsonValue; cdecl; external name 'zpr_json_new_string';
+function zpr_json_new_array: PJsonValue; cdecl; external name 'zpr_json_new_array';
+function zpr_json_new_object: PJsonValue; cdecl; external name 'zpr_json_new_object';
+function zpr_json_array_push(Arr, Value: PJsonValue): Int32; cdecl; external name 'zpr_json_array_push';
+function zpr_json_object_set(Obj: PJsonValue; Key: PAnsiChar; Value: PJsonValue): Int32; cdecl; external name 'zpr_json_object_set';
+{$ELSE}
   zpr_version: Tzpr_version;
   zpr_buffer_free: Tzpr_buffer_free;
   zpr_alloc: Tzpr_alloc;
@@ -470,6 +550,9 @@ var
   zpr_grpc_client_stream_open: Tzpr_grpc_client_stream_open;
   zpr_grpc_client_stream_read: Tzpr_grpc_client_stream_read;
   zpr_grpc_client_stream_cancel: Tzpr_grpc_client_stream_cancel;
+  zpr_grpc_client_stream_read_into: Tzpr_grpc_client_stream_read_into;
+  zpr_grpc_client_stream_buffer: Tzpr_grpc_client_stream_buffer;
+  zpr_grpc_client_stream_stats: Tzpr_grpc_client_stream_stats;
 
   zpr_protobuf_pool_new: Tzpr_protobuf_pool_new;
   zpr_protobuf_pool_free: Tzpr_protobuf_pool_free;
@@ -504,6 +587,7 @@ var
   zpr_json_new_object: Tzpr_json_new_object;
   zpr_json_array_push: Tzpr_json_array_push;
   zpr_json_object_set: Tzpr_json_object_set;
+{$ENDIF}
 
   // A permanently-allocated single NUL byte: a guaranteed-valid,
   // guaranteed-non-nil pointer to hand zpr for an empty string,
@@ -520,6 +604,7 @@ begin
     Result := PAnsiChar(S);
 end;
 
+{$IFNDEF ZPR_STATIC}
 function Resolve(const AName: AnsiString): Pointer;
 begin
   Result := DoGetProcAddress(GLib, AName);
@@ -527,6 +612,16 @@ begin
     raise ELoadError.CreateFmt('zpr: missing symbol "%s" (library version mismatch?)', [AName]);
 end;
 
+{$ENDIF}
+
+{$IFDEF ZPR_STATIC}
+/// Linked, not loaded: there is nothing to open and nothing to resolve. Kept so
+/// a program written against the dynamic build compiles unchanged against this
+/// one — the call is simply a no-op.
+procedure Load(const ALibraryPath: string);
+begin
+end;
+{$ELSE}
 procedure Load(const ALibraryPath: string);
 var
   Path: string;
@@ -557,6 +652,9 @@ begin
     zpr_grpc_client_stream_open := Tzpr_grpc_client_stream_open(Resolve('zpr_grpc_client_stream_open'));
     zpr_grpc_client_stream_read := Tzpr_grpc_client_stream_read(Resolve('zpr_grpc_client_stream_read'));
     zpr_grpc_client_stream_cancel := Tzpr_grpc_client_stream_cancel(Resolve('zpr_grpc_client_stream_cancel'));
+    zpr_grpc_client_stream_read_into := Tzpr_grpc_client_stream_read_into(Resolve('zpr_grpc_client_stream_read_into'));
+    zpr_grpc_client_stream_buffer := Tzpr_grpc_client_stream_buffer(Resolve('zpr_grpc_client_stream_buffer'));
+    zpr_grpc_client_stream_stats := Tzpr_grpc_client_stream_stats(Resolve('zpr_grpc_client_stream_stats'));
 
     zpr_protobuf_pool_new := Tzpr_protobuf_pool_new(Resolve('zpr_protobuf_pool_new'));
     zpr_protobuf_pool_free := Tzpr_protobuf_pool_free(Resolve('zpr_protobuf_pool_free'));
@@ -597,7 +695,21 @@ begin
     raise;
   end;
 end;
+{$ENDIF}
 
+{$IFDEF ZPR_STATIC}
+/// Nothing was opened, so nothing is closed. A linked library lives as long as
+/// the process does.
+procedure Unload;
+begin
+end;
+
+/// Always true: the symbols were resolved by the linker before `main` ran.
+function IsLoaded: Boolean;
+begin
+  Result := True;
+end;
+{$ELSE}
 procedure Unload;
 begin
   if GLib = InvalidLibHandle then
@@ -610,6 +722,7 @@ function IsLoaded: Boolean;
 begin
   Result := GLib <> InvalidLibHandle;
 end;
+{$ENDIF}
 
 function Version: UTF8String;
 begin
